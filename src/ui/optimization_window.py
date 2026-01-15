@@ -141,9 +141,12 @@ class OptimizationWindow(QMainWindow):
         self.btn_start = QPushButton("Start Optimization")
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setEnabled(False)
+        self.btn_save = QPushButton("Save Report")
+        self.btn_save.setEnabled(False)
         
         control_layout.addWidget(self.btn_start)
         control_layout.addWidget(self.btn_stop)
+        control_layout.addWidget(self.btn_save)
         settings_layout.addLayout(control_layout)
         
         # 4. Log
@@ -171,6 +174,7 @@ class OptimizationWindow(QMainWindow):
         self.btn_load_mol.clicked.connect(self.load_molecule)
         self.btn_start.clicked.connect(self.start_optimization)
         self.btn_stop.clicked.connect(self.stop_optimization)
+        self.btn_save.clicked.connect(self.save_results)
 
         # Internal State
         self.exp_spectrum = None # (freq, amp)
@@ -178,6 +182,9 @@ class OptimizationWindow(QMainWindow):
         self.sampling_rate = None
         self.j_coupling = None
         self.loaded_config = None
+        self.best_viz_data = None
+        self.best_params_result = None
+        self.best_cost_result = None
 
     def log(self, message):
         self.text_log.append(message)
@@ -315,6 +322,11 @@ class OptimizationWindow(QMainWindow):
     def on_new_best(self, iteration, cost, params, viz_data):
         self.log(f"New Best found at iter {iteration} (Cost: {cost:.4f})")
         
+        # Store for saving later
+        self.best_viz_data = viz_data
+        self.best_params_result = params
+        self.best_cost_result = cost
+        
         # Real-time Plotting
         if viz_data:
             try:
@@ -349,13 +361,105 @@ class OptimizationWindow(QMainWindow):
         self.log("Optimization Finished.")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_save.setEnabled(True)
         self.worker = None
 
     def on_failed(self, error):
         self.log(f"Optimization Failed: {error}")
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        # Still allow saving if we found *some* result before failure
+        if self.best_params_result is not None:
+             self.btn_save.setEnabled(True)
         self.worker = None
+
+    def save_results(self):
+        """Save the optimization report to a CSV/JSON file."""
+        if not self.best_viz_data or not self.best_params_result:
+            self.log("No results to save.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Optimization Report", "", "CSV Files (*.csv);;JSON Files (*.json)"
+        )
+        if not path:
+            return
+
+        try:
+            # Unpack Params
+            final_j, final_sg, final_trunc, final_t2 = self.best_params_result
+            
+            # Prepare Data
+            sim_freq = self.best_viz_data['sim_freq']
+            sim_amp = self.best_viz_data['sim_amp']
+            exp_freq = self.best_viz_data['exp_freq']
+            exp_amp = self.best_viz_data['exp_amp']
+            
+            # 1. Save as CSV (Spectra + Header Metadata)
+            if path.lower().endswith('.csv'):
+                import csv
+                with open(path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    # Header Info
+                    writer.writerow(["# Optimization Report"])
+                    writer.writerow(["# Final Cost", self.best_cost_result])
+                    writer.writerow(["# T2 Linewidth (Hz)", final_t2])
+                    writer.writerow(["# SG Window", final_sg])
+                    writer.writerow(["# Truncation", final_trunc])
+                    writer.writerow([])
+                    
+                    # J-Coupling Section
+                    writer.writerow(["# J-Coupling Matrix (Flattened or Rows)"])
+                    # Simple dump of matrix rows
+                    for row in final_j:
+                        writer.writerow(["# J_Row"] + list(row))
+                    writer.writerow([])
+                    
+                    # Spectral Data
+                    writer.writerow(["Frequency (Hz)", "Experimental Amp", "Simulated Amp"])
+                    
+                    # Ensure lengths match (interpolate if needed, but usually they are on same grid if optimizer did its job)
+                    # In optimizer.py: sim is generated with npoints=len(exp) and sweep=max(exp).
+                    # So they should be 1:1.
+                    min_len = min(len(exp_freq), len(sim_freq))
+                    
+                    # Scale Simulation for report (visual match)
+                    scale = 1.0
+                    if np.max(sim_amp) > 0 and np.max(exp_amp) > 0:
+                        scale = np.max(exp_amp) / np.max(sim_amp)
+                    
+                    for i in range(min_len):
+                        writer.writerow([
+                            exp_freq[i],
+                            exp_amp[i],
+                            sim_amp[i] * scale
+                        ])
+                        
+                self.log(f"Saved CSV report to {path}")
+
+            # 2. Save as JSON
+            elif path.lower().endswith('.json'):
+                import json
+                report = {
+                    "final_cost": float(self.best_cost_result),
+                    "parameters": {
+                        "t2_linewidth": float(final_t2),
+                        "sg_window": int(final_sg),
+                        "truncation": int(final_trunc),
+                        "j_coupling": final_j.tolist()
+                    },
+                    "spectra": {
+                         "frequency": exp_freq.tolist(),
+                         "experimental": exp_amp.tolist(),
+                         "simulated": (sim_amp * (np.max(exp_amp)/np.max(sim_amp) if np.max(sim_amp) > 0 else 1.0)).tolist()
+                    }
+                }
+                with open(path, 'w') as f:
+                    json.dump(report, f, indent=4)
+                self.log(f"Saved JSON report to {path}")
+
+        except Exception as e:
+            self.log(f"Error saving results: {e}")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
