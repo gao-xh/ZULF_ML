@@ -7,16 +7,21 @@ import matplotlib.pyplot as plt
 from ..config import OPTIMIZER_CONFIG, SIMULATION_CONFIG
 
 class ZulfOptimizer:
-    def __init__(self, exp_fid, sampling_rate, spins):
+    def __init__(self, spins, sampling_rate, exp_fid=None, exp_spectrum=None):
         """
         Args:
-            exp_fid (np.ndarray): Experimental FID (Complex time domain signal).
-            sampling_rate (float): Sampling rate in Hz.
             spins (list): List of spins e.g. ['1H', '13C'].
+            sampling_rate (float): Sampling rate in Hz.
+            exp_fid (np.ndarray, optional): Experimental FID (Complex time domain signal).
+            exp_spectrum (tuple, optional): (freq_axis, amp_axis) if FID is not available.
         """
         self.exp_fid = exp_fid
+        self.exp_spectrum = exp_spectrum
         self.sampling_rate = sampling_rate
         self.spins = spins
+        
+        if self.exp_fid is None and self.exp_spectrum is None:
+             raise ValueError("Must provide either exp_fid or exp_spectrum.")
         
         # Load Configs
         self.config = OPTIMIZER_CONFIG
@@ -84,7 +89,7 @@ class ZulfOptimizer:
              
         return config.elasticity * penalty
 
-    def run(self, init_j, init_sg_window=None, init_trunc_idx=None, init_t2=None):
+    def run(self, init_j, init_sg_window=None, init_trunc_idx=None, init_t2=None, callback=None):
         """
         Run Constrained Random Walk Optimization.
         """
@@ -142,6 +147,11 @@ class ZulfOptimizer:
             
             self.history.append(curr_cost)
             
+            if callback:
+                if callback(i, curr_cost, self.best_cost, self.best_params) is False:
+                    print("Optimization stopped by callback.")
+                    break
+
             if i % self.config.plot_interval == 0:
                 pass # self.plot_progress(i)
                 
@@ -160,12 +170,15 @@ class ZulfOptimizer:
         center_j = None  # Not needed for re-evaluation, only for penalty
 
         # Re-generate Experimental Spectrum
-        proc_fid = apply_processing(self.exp_fid, sg_window=None, truncation_idx=best_trunc)
-        exp_freq, exp_amp = get_spectrum_from_fid(
-            proc_fid, 
-            self.sampling_rate, 
-            sg_window=best_sg
-        )
+        if self.exp_fid is not None:
+            proc_fid = apply_processing(self.exp_fid, sg_window=None, truncation_idx=best_trunc)
+            exp_freq, exp_amp = get_spectrum_from_fid(
+                proc_fid, 
+                self.sampling_rate, 
+                sg_window=best_sg
+            )
+        else:
+            exp_freq, exp_amp = self.exp_spectrum
 
         # Re-generate Simulated Spectrum
         max_f = np.max(exp_freq) if len(exp_freq) > 0 else 400.0
@@ -210,13 +223,17 @@ class ZulfOptimizer:
 
     def evaluate(self, j_coupling, sg_window, trunc_idx, t2_linewidth, center_j):
         # 1. Process Experimental Data
-        proc_fid = apply_processing(self.exp_fid, sg_window=None, truncation_idx=trunc_idx)
-        
-        exp_freq, exp_amp = get_spectrum_from_fid(
-            proc_fid, 
-            self.sampling_rate, 
-            sg_window=sg_window
-        )
+        if self.exp_fid is not None:
+             proc_fid = apply_processing(self.exp_fid, sg_window=None, truncation_idx=trunc_idx)
+             
+             exp_freq, exp_amp = get_spectrum_from_fid(
+                 proc_fid, 
+                 self.sampling_rate, 
+                 sg_window=sg_window
+             )
+        else:
+             # Use pre-loaded spectrum directly
+             exp_freq, exp_amp = self.exp_spectrum
         
         # 2. Simulate Theoretical Spectrum (use optimized T2)
         max_f = np.max(exp_freq) if len(exp_freq) > 0 else 400.0

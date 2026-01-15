@@ -1,86 +1,111 @@
 import sys
 import os
+import argparse
+import numpy as np
+from PySide6.QtWidgets import QApplication
 
-import sys
-import os
-
-# Add src directory and references to path
-import sys, os
+# Local Imports
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(project_root, 'src'))
-# Add ZULF Suite to path (crucial for it to find its own modules)
-zulf_suite_path = os.path.join(project_root, 'references', 'ZULF_NMR_Suite')
-sys.path.append(zulf_suite_path)
 
-import numpy as np
 from src.core.optimizer import ZulfOptimizer
-from src.config import OPTIMIZER_CONFIG, SIMULATION_CONFIG
+from src.utils.loaders import load_experimental_and_config, load_molecule_from_csv
+from src.ui.optimization_window import OptimizationWindow
 
-def generate_mock_data():
-    """Generate mock experimental FID for testing."""
-    # True Params
-    true_j = np.array([
-        [0, 140],
-        [140, 0]
-    ])
-    spins = ['1H', '13C']
-    sampling_rate = 2000 # Hz
-    duration = 1.0 # sec
-    
-    # Simulate Spectrum directly for now as we don't have FID simulator in simulation.py yet
-    # But wait, optimizer expects FID.
-    # Let's mock a simple FID.
-    t = np.linspace(0, duration, int(sampling_rate * duration))
-    # Signal: sum of cos(2pi f t)
-    # J=140 Hz (scalar coupling), in zero field usually gives lines at J, 3J/2 etc. dependent on system. 
-    # For AX system (which 1H-13C is approx at ZF? No, strongly coupled).
-    # Let's just create a dummy FID with some frequencies.
-    frequencies = [140.0, 210.0] 
-    fid = np.zeros_like(t, dtype=complex)
-    for f in frequencies:
-        fid += np.exp(1j * 2 * np.pi * f * t) * np.exp(-t/0.5) # Decay T2=0.5s
-        
-    return fid, sampling_rate, spins, true_j
-
-def main():
-    print("Starting ML_ZULF project - ZULF Optimizer...")
+def run_cli(args):
+    """Run optimization in CLI mode."""
+    print("--- ZULF-NMR Optimizer (CLI) ---")
     
     # 1. Load Data
-    print("1. Generating mock experimental data...")
-    exp_fid, sampling_rate, spins, true_j = generate_mock_data()
+    if args.data and os.path.exists(args.data):
+        try:
+            exp_spectrum, sampling_rate, _, _ = load_experimental_and_config(args.data)
+            print(f"Loaded Experimental Data: {args.data}")
+            exp_fid = None
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            return
+    else:
+        print("Error: Please provide a valid data folder path using --data")
+        return
+
+    # 2. Load Molecule
+    spins = ['1H', '13C'] # Default
+    init_j = np.zeros((2,2)) 
     
-    # 2. Setup Optimizer
-    print("2. Setting up Optimizer...")
+    if args.molecule and os.path.exists(args.molecule):
+        try:
+            spins, init_j = load_molecule_from_csv(args.molecule)
+            print(f"Loaded Molecule: {spins}")
+        except Exception as e:
+            print(f"Error loading molecule: {e}")
+            return
+    else:
+        print("Warning: No molecule file provided, using default/placeholders.")
+
+    # 3. Setup Optimizer
     optimizer = ZulfOptimizer(
-        exp_fid=exp_fid,
+        spins=spins,
         sampling_rate=sampling_rate,
-        spins=spins
+        exp_spectrum=exp_spectrum
     )
     
-    # 3. Random Walk
-    # Initial Guess: J=100 (off by 40Hz), SG=5, Trunc=Full
-    init_j = np.array([[0, 100.0], [100.0, 0]])
+    # 4. Run
+    print(f"Starting optimization ({args.iter} iterations)...")
     init_sg = 5
-    init_trunc = len(exp_fid)
+    init_trunc = 1000
     init_t2 = 1.0
     
-    print("3. Starting Random Walk Optimization...")
+    # Run
+    optimizer.config.max_iterations = args.iter
     best_params, history = optimizer.run(init_j, init_sg, init_trunc, init_t2)
     
-    best_j, best_sg, best_trunc, best_t2 = best_params
+    # Result
+    print("\n--- Optimization Complete ---")
+    print(f"Best Cost: {history[-1]:.4f}")
+    print(f"Best J:\n{best_params[0]}")
     
-    print("-" * 30)
-    print("Optimization Complete.")
-    print(f"True J: {true_j[0,1]}")
-    print(f"Best J: {best_j[0,1]}")
-    print(f"Best SG: {best_sg}")
-    print(f"Best Trunc: {best_trunc}")
-    print(f"Best T2: {best_t2:.4f}")
-    print("-" * 30)
+    if args.output:
+        optimizer.plot_comparison(save_path=args.output)
+        print(f"Plot saved to {args.output}")
+
+def run_ui():
+    """Launch the Graphical User Interface."""
+    print("Launching UI...")
+    app = QApplication(sys.argv)
+    window = OptimizationWindow()
+    window.show()
+    sys.exit(app.exec())
+
+def main():
+    parser = argparse.ArgumentParser(description="ZULF-NMR ML Optimizer")
     
-    # 4. Visualization
-    print("4. Generating Comparison Plot...")
-    optimizer.plot_comparison(save_path="optimization_result.png")
+    # Modes
+    parser.add_argument('--ui', action='store_true', help="Launch the GUI (Default if no other args provided)")
+    parser.add_argument('--cli', action='store_true', help="Run in CLI mode")
+    
+    # CLI Arguments
+    parser.add_argument('--data', type=str, help="Path to experimental data folder (containing spectrum.csv)")
+    parser.add_argument('--molecule', type=str, help="Path to molecule structure.csv")
+    parser.add_argument('--iter', type=int, default=100, help="Number of iterations")
+    parser.add_argument('--output', type=str, default="result.png", help="Path to save result plot")
+
+    args = parser.parse_args()
+
+    # Decision Logic
+    if args.cli:
+        run_cli(args)
+    elif args.ui:
+        run_ui()
+    else:
+        # Default behavior: If no specific CLI args, launch UI?
+        # Or check if any functional args are present.
+        if args.data or args.molecule:
+            # User tried to run CLI but forgot --cli flag, let's just run it
+            run_cli(args)
+        else:
+            # Default to UI
+            run_ui()
 
 if __name__ == "__main__":
     main()
