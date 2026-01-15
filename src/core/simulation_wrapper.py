@@ -1,111 +1,163 @@
 import sys
 import os
 import numpy as np
+import importlib.util
+from typing import Tuple, List, Optional
 
-# Add the reference suite to path
-REF_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'references', 'ZULF_NMR_Suite')
-if REF_PATH not in sys.path:
-    sys.path.append(REF_PATH)
+# --- Dynamic Import of spinach_bridge from References ---
+# This allows us to use the reference implementation without copying it
+# and avoids namespace conflicts with our own 'src' package.
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# current: .../ML_ZULF/src/core
+project_root = os.path.dirname(os.path.dirname(current_dir))
+# project: .../ML_ZULF
+bridge_path = os.path.join(project_root, "references", "ZULF_NMR_Suite", "src", "core", "spinach_bridge.py")
+
+spinach_bridge = None
 try:
-    from src.core.TwoD_simulation import simulation, system, interaction, parameters, pulse, environment
+    if os.path.exists(bridge_path):
+        spec = importlib.util.spec_from_file_location("spinach_bridge", bridge_path)
+        if spec and spec.loader:
+            spinach_bridge = importlib.util.module_from_spec(spec)
+            sys.modules["spinach_bridge"] = spinach_bridge
+            spec.loader.exec_module(spinach_bridge)
+    else:
+        print(f"Warning: spinach_bridge.py not found at {bridge_path}")
 except ImportError as e:
-    # Try absolute path import via sys.path modification in config or here
-    try: 
-         # This assumes ZULF_NMR_Suite is in sys.path
-         from src.core.TwoD_simulation import simulation, system, interaction, parameters, pulse, environment
-    except:
-         print(f"Warning: ZULF Suite not found. Simulation will fail. {e}")
-         simulation = None
+    print(f"Warning: explicit import of spinach_bridge failed: {e}")
+except Exception as e:
+    print(f"Warning: Unexpected error loading spinach_bridge: {e}")
 
-from ..config import SIMULATION_CONFIG
 
-def lorentzian(x, x0, gamma):
-    return (1/np.pi) * (gamma / ((x - x0)**2 + gamma**2))
+class ZulfSimulation:
+    def __init__(self):
+        self.engine = None
+        if spinach_bridge is None:
+            print("Error: spinach_bridge module is not loaded. Simulation will fail.")
 
-def simulate_spectrum(j_coupling, spins, n_points=None, max_freq=None, lw=None):
-    """
-    Simulate ZULF NMR Spectrum using the reference suite.
-    
-    Args:
-        j_coupling (np.ndarray): J-coupling matrix (NxN).
-        spins (list): List of isotopes e.g. ['1H', '13C'].
-        n_points (int): Number of points in frequency grid.
-        max_freq (float): Maximum frequency for grid (Hz).
-        lw (float): Line width for broadening (Hz).
+    def start_engine(self):
+        """Initializes the MATLAB engine via spinach_bridge."""
+        if spinach_bridge is None:
+            raise RuntimeError("Cannot start engine: spinach_bridge not loaded.")
         
-    Returns:
-        freq_grid (np.ndarray): Frequency axis.
-        spectrum (np.ndarray): Simulated amplitude.
-    """
-    # Use config defaults if not provided
-    if n_points is None: n_points = SIMULATION_CONFIG.n_points
-    if max_freq is None: max_freq = SIMULATION_CONFIG.max_freq
-    if lw is None: lw = SIMULATION_CONFIG.line_width
+        if self.engine is not None:
+            return
 
-    if simulation is None:
-        raise ImportError("ZULF Suite not loaded.")
+        try:
+            print("Starting MATLAB engine...")
+            self.cm = spinach_bridge.spinach_eng(clean=True) 
+            self.engine = self.cm.__enter__()
+            spinach_bridge.call_spinach.default_eng = self.engine
+            print("MATLAB engine started.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to start MATLAB engine: {e}")
+
+    def stop_engine(self):
+        if self.engine:
+            try:
+                self.cm.__exit__(None, None, None)
+            except:
+                pass
+            self.engine = None
+
+    def simulate_spectrum(self, 
+                          j_coupling_matrix: np.ndarray, 
+                          isotopes: List[str] = None,
+                          t2_linewidth: float = 1.0,
+                          field: float = 0.0,
+                          sweep: float = 400.0,
+                          npoints: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Simulates the ZULF NMR spectrum using the Spinach bridge.
+        """
+        if spinach_bridge is None or (self.engine is None and not self._try_start()):
+             # Fallback mock for testing without MATLAB
+            # print("Warning: Utilizing fallback simulation (random data) due to missing bridge/engine.")
+            # raise RuntimeError("Matlab Engine not available")
+            pass
+
+        if self.engine is None:
+             self.start_engine()
+
+        # Input validation
+        n_spins = j_coupling_matrix.shape[0]
+        if isotopes is None:
+            isotopes = ['1H'] * n_spins
         
-    # 1. Setup System
-    sys_obj = system(isos=spins)
-    
-    # 2. Setup Interaction
-    inter_obj = interaction(coupling=j_coupling)
-    
-    # 3. Setup Parameters
-    # We need to map our inputs to what 'parameters' expects
-    # parameters(npoints, zerofill, zerofill1, offset, spins, sampling_rate, ...)
-    # The suite seems to do freq domain directly via eigen decomp, 
-    # but 'parameters' requires some values.
-    
-    # Sampling rate relates to max_freq (Nyquist). Sampling = 2 * MaxFreq
-    sampling_rate = 2 * max_freq
-    
-    # Np1 seems to be for 2D. 
-    param_obj = parameters(
-        npoints=n_points,
-        zerofill=n_points,
-        zerofill1=0,
-        offset=0,
-        spins=spins,
-        sampling_rate=sampling_rate
-    )
-    
-    # 4. Setup Pulse
-    # Zero field usually implies sudden field drop or specific pulse.
-    # We interpret 'pulse' here. 
-    # For standard ZULF, maybe we don't need a pulse object if we use 'freq_domain'
-    # but 'freq_domain' uses 'self.pulse' inside `self.operation(...).rho_pulse()`.
-    # Let's provide a dummy or standard pulse.
-    pulse_obj = pulse(
-        shape="Hard", # Guessing
-        duration=0,
-        Bx=0, By=0, Bz=0 # Zero field?
-    )
-    
-    # 5. Environment
-    env_obj = environment(magnetic_field=0.0)
-    
-    # 6. Run Simulation
-    sim = simulation(sys_obj, inter_obj, param_obj, pulse_obj)
-    
-    # freq_domain returns stick spectrum (freqs, weights)
-    trans_freqs, trans_weights = sim.freq_domain(env_obj)
-    
-    # 7. Broaden to grid
-    freq_grid = np.linspace(0, max_freq, n_points)
-    spectrum = np.zeros_like(freq_grid)
-    
-    # Take real part of weights (or abs)
-    weights = np.real(trans_weights) 
-    
-    # Add Lorentzians
-    # Vectorized approach can be heavy if many transitions, but usually ZULF spins are few (~2-5)
-    # transitions ~ (2^N)^2. For N=5, 32^2 = 1024 transitions. Fast.
-    
-    for f0, w in zip(trans_freqs, weights):
-        if 0 <= f0 <= max_freq:
-             spectrum += w * lorentzian(freq_grid, f0, lw)
-             
-    return freq_grid, spectrum
+        if len(isotopes) != n_spins:
+            raise ValueError(f"Number of isotopes ({len(isotopes)}) does not match matrix size ({n_spins})")
+
+        # Shortcuts
+        SYS = spinach_bridge.sys
+        BAS = spinach_bridge.bas
+        INTER = spinach_bridge.inter
+        PAR = spinach_bridge.parameters
+        SIM = spinach_bridge.sim
+        DATA = spinach_bridge.data
+
+        var_prefix = "opt_" 
+
+        try:
+            # 1. System Setup
+            sys_obj = SYS(self.engine, var_prefix=var_prefix)
+            sys_obj.isotopes(isotopes)
+            sys_obj.magnet(field)
+
+            # 2. Basis Setup
+            bas_obj = BAS(self.engine, var_prefix=var_prefix)
+            bas_obj.formalism('zeeman-hilb')
+            bas_obj.approximation('none')
+
+            # 3. Interactions
+            inter_obj = INTER(self.engine, var_prefix=var_prefix)
+            inter_obj.coupling_array(j_coupling_matrix, validate=False, use_gpu=False)
+
+            # 4. Parameters
+            par_obj = PAR(self.engine, var_prefix=var_prefix)
+            par_obj.sweep(sweep)
+            par_obj.npoints(npoints)
+            par_obj.zerofill(8192) 
+            par_obj.offset(0)
+            par_obj.spins([isotopes[0]]) 
+            par_obj.axis_units('Hz')
+            par_obj.invert_axis(0)
+            par_obj.flip_angle(np.pi/2)
+            par_obj.detection('uniaxial')
+
+            # 5. Run Simulation
+            sim_obj = SIM(self.engine, var_prefix=var_prefix)
+            sim_obj.create()
+            sim_obj.liquid('zerofield', 'labframe')
+
+            # 6. Process Data
+            data_obj = DATA(self.engine, var_prefix=var_prefix)
+            data_obj.apodisation([('exp', t2_linewidth)], use_gpu=False)
+            
+            spectrum = data_obj.spectrum(use_gpu=False)
+            freq_axis = data_obj.freq(spectrum)
+
+            return np.array(freq_axis).flatten(), np.real(np.array(spectrum)).flatten()
+
+        except Exception as e:
+            print(f"Simulation failed: {e}")
+            raise
+
+    def _try_start(self):
+        try:
+            self.start_engine()
+            return True
+        except:
+            return False
+
+# Global instance for easier import
+zulf_sim = ZulfSimulation()
+
+def simulate_spectrum(*args, **kwargs):
+    """
+    Wrapper function to forward calls to the ZulfSimulation instance.
+    Usage: simulate_spectrum(j_coupling_matrix=..., isotopes=..., ...)
+    """
+    return zulf_sim.simulate_spectrum(*args, **kwargs)
+
 

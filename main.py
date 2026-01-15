@@ -54,11 +54,7 @@ def main():
     optimizer = ZulfOptimizer(
         exp_fid=exp_fid,
         sampling_rate=sampling_rate,
-        spins=spins,
-        max_iter=OPTIMIZER_CONFIG.max_iterations,
-        step_j=OPTIMIZER_CONFIG.step_j_coupling,
-        step_sg=OPTIMIZER_CONFIG.step_sg_window,
-        step_trunc=OPTIMIZER_CONFIG.step_truncation
+        spins=spins
     )
     
     # 3. Random Walk
@@ -66,11 +62,12 @@ def main():
     init_j = np.array([[0, 100.0], [100.0, 0]])
     init_sg = 5
     init_trunc = len(exp_fid)
+    init_t2 = 1.0
     
     print("3. Starting Random Walk Optimization...")
-    best_params, history = optimizer.run(init_j, init_sg, init_trunc)
+    best_params, history = optimizer.run(init_j, init_sg, init_trunc, init_t2)
     
-    best_j, best_sg, best_trunc = best_params
+    best_j, best_sg, best_trunc, best_t2 = best_params
     
     print("-" * 30)
     print("Optimization Complete.")
@@ -78,10 +75,12 @@ def main():
     print(f"Best J: {best_j[0,1]}")
     print(f"Best SG: {best_sg}")
     print(f"Best Trunc: {best_trunc}")
+    print(f"Best T2: {best_t2:.4f}")
     print("-" * 30)
-
-if __name__ == "__main__":
-    main()
+    
+    # 4. Visualization
+    print("4. Generating Comparison Plot...")
+    optimizer.plot_comparison(save_path="optimization_result.png")
 
 if __name__ == "__main__":
     main()
