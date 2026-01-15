@@ -22,7 +22,7 @@ class OptimizationWorker(QThread):
     """
     log = Signal(str)
     progress = Signal(int, float)            # iteration, current_cost
-    new_best = Signal(int, float, object)    # iteration, best_cost, best_params
+    new_best = Signal(int, float, object, object)    # iteration, best_cost, best_params, viz_data
     finished = Signal(object, list)          # best_params, history
     failed = Signal(str)
 
@@ -48,18 +48,15 @@ class OptimizationWorker(QThread):
     def stop(self):
         self._is_running = False
 
-    def _step_callback(self, i, curr_cost, best_cost, best_params):
+    def _step_callback(self, i, curr_cost, best_cost, best_params, viz_data=None):
         if not self._is_running:
             return False # Stop optimizer
         
         self.progress.emit(i, curr_cost)
         
-        # Check if this is a new best locally to emit specific signal?
-        # The optimizer prints it, but we want UI to know.
-        # We can just emit 'new_best' every time or track it here.
-        # For now, let's emit if it matches the optimizer's best
-        if best_cost == curr_cost: 
-             self.new_best.emit(i, best_cost, best_params)
+        # Emit new best if applicable (cost has improved)
+        if best_cost == curr_cost and viz_data is not None: 
+             self.new_best.emit(i, best_cost, best_params, viz_data)
              
         return True
 
@@ -291,15 +288,38 @@ class OptimizationWindow(QMainWindow):
         if iteration % 10 == 0:
             self.log(f"Iter {iteration}: Cost {cost:.4f}")
 
-    def on_new_best(self, iteration, cost, params):
-        self.log(f"Checking new best at iter {iteration} (Cost: {cost:.4f})")
-        # Trigger plotting
-        # We need to simulate spectrum with these params to plot it
-        # Prefer doing this in main thread? Or have worker output the spec?
-        # ZulfOptimizer.simulate_spectrum is fast enough? 
-        # Actually it calls MATLAB. That shouldn't be done in Main Thread if possible.
-        # But if we are just plotting, maybe we wait for the next periodic update?
-        pass
+    def on_new_best(self, iteration, cost, params, viz_data):
+        self.log(f"New Best found at iter {iteration} (Cost: {cost:.4f})")
+        
+        # Real-time Plotting
+        if viz_data:
+            try:
+                self.ax.clear()
+                
+                # Extract Data
+                sim_freq = viz_data['sim_freq']
+                sim_amp = viz_data['sim_amp']
+                exp_freq = viz_data['exp_freq']
+                exp_amp = viz_data['exp_amp']
+                
+                # Plot Experimental (Black)
+                self.ax.plot(exp_freq, exp_amp, 'k-', alpha=0.6, label='Experiment')
+                
+                # Plot Simulated (Red Dashed)
+                # Auto-scaling if sim amplitude is arbitrary vs exp
+                if np.max(sim_amp) > 0 and np.max(exp_amp) > 0:
+                    scale = np.max(exp_amp) / np.max(sim_amp)
+                    self.ax.plot(sim_freq, sim_amp * scale, 'r--', label='Simulated (Best)')
+                else:
+                    self.ax.plot(sim_freq, sim_amp, 'r--', label='Simulated (Best)')
+                    
+                self.ax.set_title(f"Optimization Progress (Iter {iteration}, Cost {cost:.2f})")
+                self.ax.set_xlabel("Frequency (Hz)")
+                self.ax.legend()
+                self.canvas.draw()
+                
+            except Exception as e:
+                print(f"Plotting error: {e}")
 
     def on_finished(self, best_params, history):
         self.log("Optimization Finished.")

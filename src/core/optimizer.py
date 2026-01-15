@@ -108,7 +108,7 @@ class ZulfOptimizer:
         curr_t2 = float(init_t2)
         
         # Initial Evaluate
-        curr_cost, _ = self.evaluate(curr_j, curr_sg, curr_trunc, curr_t2, center_j)
+        curr_cost, _, _, _ = self.evaluate(curr_j, curr_sg, curr_trunc, curr_t2, center_j)
         
         self.best_cost = curr_cost
         self.best_params = (np.copy(curr_j), curr_sg, curr_trunc, curr_t2)
@@ -126,7 +126,7 @@ class ZulfOptimizer:
             
             # 2. Evaluate
             try:
-                new_cost, _ = self.evaluate(new_j, new_sg, new_trunc, new_t2, center_j)
+                new_cost, _, new_sim_spec, new_exp_spec = self.evaluate(new_j, new_sg, new_trunc, new_t2, center_j)
             except Exception as e:
                 print(f"Iter {i} failed: {e}")
                 new_cost = float('inf')
@@ -144,11 +144,22 @@ class ZulfOptimizer:
                     self.best_cost = new_cost
                     self.best_params = (np.copy(curr_j), curr_sg, curr_trunc, curr_t2)
                     print(f"Iter {i}: New Best Cost = {self.best_cost:.4f}")
-            
+
             self.history.append(curr_cost)
             
             if callback:
-                if callback(i, curr_cost, self.best_cost, self.best_params) is False:
+                # If new best, pass spectrum details
+                vis_data = None
+                if curr_cost == self.best_cost:
+                    # Current step is the best so far (or equal)
+                    vis_data = {
+                        "sim_freq": new_sim_spec[0],
+                        "sim_amp": new_sim_spec[1],
+                        "exp_freq": new_exp_spec[0],
+                        "exp_amp": new_exp_spec[1]
+                    }
+                    
+                if callback(i, curr_cost, self.best_cost, self.best_params, vis_data) is False:
                     print("Optimization stopped by callback.")
                     break
 
@@ -258,5 +269,7 @@ class ZulfOptimizer:
         pen_trunc = self._calculate_penalty(trunc_idx, self.config.truncation)
         
         total = fit_cost + pen_j + pen_t2 + pen_sg + pen_trunc
-        return total, components
+        
+        # Return spectra for visualization
+        return total, components, (sim_freq, sim_amp), (exp_freq, exp_amp)
 
