@@ -111,8 +111,27 @@ class OptimizationWindow(QMainWindow):
 
         self.spin_plot_interval.setToolTip("Update plot every N steps")
 
+        # --- New Parameter Inputs ---
+        self.spin_t2 = QDoubleSpinBox()
+        self.spin_t2.setRange(0.01, 20.0)
+        self.spin_t2.setValue(0.5)
+        self.spin_t2.setSingleStep(0.1)
+
+        self.spin_sg = QSpinBox()
+        self.spin_sg.setRange(5, 501)
+        self.spin_sg.setValue(101)
+        self.spin_sg.setSingleStep(2)
+
+        self.spin_trunc = QSpinBox()
+        self.spin_trunc.setRange(0, 5000)
+        self.spin_trunc.setValue(160)
+        self.spin_trunc.setSingleStep(10)
+
         param_form.addRow("Max Iterations:", self.spin_steps)
         param_form.addRow("Plot Interval:", self.spin_plot_interval)
+        param_form.addRow("Linewidth (Hz):", self.spin_t2)
+        param_form.addRow("SG Window (pts):", self.spin_sg)
+        param_form.addRow("Truncation (pts):", self.spin_trunc)
         
         param_group.setLayout(param_form)
         settings_layout.addWidget(param_group)
@@ -228,6 +247,11 @@ class OptimizationWindow(QMainWindow):
             config = OptimizerConfig()
             config.max_iterations = self.spin_steps.value()
             config.plot_interval = self.spin_plot_interval.value()
+
+            # Map UI params to Config (for elasticity centers)
+            config.t2_linewidth.initial_value = self.spin_t2.value()
+            config.sg_window.initial_value = self.spin_sg.value()
+            config.truncation.initial_value = self.spin_trunc.value()
             
             # 2. Parameters
             # Default spins if not set (fallback)
