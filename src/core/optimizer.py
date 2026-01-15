@@ -167,7 +167,7 @@ class ZulfOptimizer:
         curr_t2 = float(init_t2)
         
         # Initial Evaluate
-        curr_cost, _, _, _ = self.evaluate(curr_j_numeric, curr_sg, curr_trunc, curr_t2, center_j if not variable_config else None, freq_range)
+        curr_cost, _, init_sim_spec, init_exp_spec = self.evaluate(curr_j_numeric, curr_sg, curr_trunc, curr_t2, center_j if not variable_config else None, freq_range)
         
         # Best params format depends on mode
         # Just store the numeric matrix for uniformity in result?
@@ -177,6 +177,17 @@ class ZulfOptimizer:
         self.best_params = (curr_j_numeric, curr_sg, curr_trunc, curr_t2)
         
         print(f"Initial Cost: {curr_cost:.4f}")
+
+        # Force Report Initial State (Iter -1)
+        if callback:
+            init_vis_data = {
+                "sim_freq": init_sim_spec[0],
+                "sim_amp": init_sim_spec[1],
+                "exp_freq": init_exp_spec[0],
+                "exp_amp": init_exp_spec[1]
+            }
+            # Callback with iter=-1 to indicate initialization
+            callback(-1, curr_cost, curr_cost, self.best_params, init_vis_data)
         
         max_iter = self.config.max_iterations
         
@@ -354,15 +365,24 @@ class ZulfOptimizer:
              exp_freq, exp_amp = self.exp_spectrum
         
         # 2. Simulate Theoretical Spectrum (use optimized T2)
-        max_f = np.max(exp_freq) if len(exp_freq) > 0 else 400.0
+        # Fix Sweep Width: 'sweep' in Spinach is often full spectral width.
+        # If exp_freq is -500 to 500, max_f is 500, sweep should be 1000?
+        # Assuming ZULF spectra are low-frequency centered around zero or DC.
+        # If max_f is used as sweep, it covers [-max_f/2, max_f/2]. 
+        # If exp data goes up to max_f, we need sweep = 2 * max_f to cover [-max_f, max_f].
+        
+        max_f = np.max(np.abs(exp_freq)) if len(exp_freq) > 0 else 400.0
+        # Ensure we cover the full range of experimental data
+        sweep_width = 2 * max_f
         
         # Call simulate_spectrum with corrected parameter names for ZulfSimulation
-        # Mapping: max_freq -> sweep, n_points -> npoints, lw -> t2_linewidth
         sim_freq, sim_amp = simulate_spectrum(
             j_coupling_matrix=j_coupling, 
             isotopes=self.spins, 
-            npoints=len(exp_freq),
-            sweep=max_f,
+            npoints=len(exp_freq), # Match resolution? 
+            # Note: npoints should probably be higher or matched to sweep_width / resolution
+            # For now keeping it simple: match number of points of exp data (approx)
+            sweep=sweep_width,
             t2_linewidth=t2_linewidth 
         )
 
@@ -377,18 +397,33 @@ class ZulfOptimizer:
             mask_sim = np.ones_like(sim_freq, dtype=bool)
             if f_min is not None: mask_sim &= (sim_freq >= f_min)
             if f_max is not None: mask_sim &= (sim_freq <= f_max)
-            eff_sim_freq = sim_freq[mask_sim]
-            eff_sim_amp = sim_amp[mask_sim]
+            
+            if np.any(mask_sim):
+                eff_sim_freq = sim_freq[mask_sim]
+                eff_sim_amp = sim_amp[mask_sim]
+            else:
+                 # Warning: Filter removed all data!
+                 return float('inf'), {}, (sim_freq, sim_amp), (exp_freq, exp_amp)
             
             # Filter Experimental
             mask_exp = np.ones_like(exp_freq, dtype=bool)
             if f_min is not None: mask_exp &= (exp_freq >= f_min)
             if f_max is not None: mask_exp &= (exp_freq <= f_max)
-            eff_exp_freq = exp_freq[mask_exp]
-            eff_exp_amp = exp_amp[mask_exp]
+            
+            if np.any(mask_exp):
+                eff_exp_freq = exp_freq[mask_exp]
+                eff_exp_amp = exp_amp[mask_exp]
+            else:
+                 # Warning: Filter removed all exp data!
+                 return float('inf'), {}, (sim_freq, sim_amp), (exp_freq, exp_amp)
         
         # 3. Calculate Fit Cost
-        fit_cost, components = total_cost(eff_sim_freq, eff_sim_amp, eff_exp_freq, eff_exp_amp)
+        try:
+            fit_cost, components = total_cost(eff_sim_freq, eff_sim_amp, eff_exp_freq, eff_exp_amp)
+        except Exception as e:
+            print(f"Cost calculation failed: {e}")
+            fit_cost = float('inf')
+            components = {}
         
         # 4. Calculate Constraint Penalty
         pen_j = self._calculate_penalty(j_coupling, self.config.j_coupling, center_val=center_j)

@@ -36,7 +36,15 @@ def calculate_pos_err(sim_freq, sim_amp, exp_freq, exp_amp, height_threshold=0.1
     # Match the count
     n_peaks = min(len(sim_top_freqs), len(exp_top_freqs))
     if n_peaks == 0:
-        return 1e6 # Large penalty if no peaks found
+        # Avoid hard 1e6 penalty if possible, try at least L2 or standard deviation
+        # But if we found NO peaks in simulation, it means simulation is flat or wrong.
+        # Check if simulation is zero-amplitude
+        if np.max(np.abs(sim_amp)) < 1e-9:
+             print("Warning: Simulated spectrum has near-zero amplitude. Check simulation parameters.")
+             return 1e6
+        else:
+             # Just no peaks found above threshold
+             return 5e5 
         
     # Calculate error on top N peaks
     # NOTE: This assumes the "k-th strongest peak" in Sim corresponds to "k-th strongest" in Exp.

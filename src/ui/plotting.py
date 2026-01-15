@@ -85,16 +85,28 @@ class SpectrumWidget(QWidget):
         # Styles
         # Experimental: Black solid line, slightly transparent
         if exp_freq is not None:
-             ax.plot(exp_freq, exp_amp, 'k-', linewidth=1.2, alpha=0.6, label='Experiment')
+             # Just filter for positive frequencies logic
+             mask_exp = exp_freq >= 0
+             e_f = exp_freq[mask_exp]
+             e_a = exp_amp[mask_exp]
+             ax.plot(e_f, e_a, 'k-', linewidth=1.2, alpha=0.6, label='Experiment')
         
         # Simulated: Red dashed line
         if sim_freq is not None and sim_amp is not None:
+             # Just filter for positive frequencies logic
+             mask_sim = sim_freq >= 0
+             s_f = sim_freq[mask_sim]
+             s_a = sim_amp[mask_sim]
+
              # Auto-scale simulation to match experiment max (Visualization only)
              scale = 1.0
-             if np.max(sim_amp) > 0 and exp_amp is not None and np.max(exp_amp) > 0:
-                 scale = np.max(exp_amp) / np.max(sim_amp)
+             # Note: exp_amp might be None or full array, better use e_a if defined
+             max_exp_amp = np.max(e_a) if 'e_a' in locals() and len(e_a) > 0 else (np.max(exp_amp) if exp_amp is not None else 0)
              
-             ax.plot(sim_freq, sim_amp * scale, 'r--', linewidth=1.0, label=f'Simulated (x{scale:.2f})')
+             if np.max(s_a) > 0 and max_exp_amp > 0:
+                 scale = max_exp_amp / np.max(s_a)
+             
+             ax.plot(s_f, s_a * scale, 'r--', linewidth=1.0, label=f'Simulated (x{scale:.2f})')
              
         # Labels and Title
         title = "Optimization Progress"
@@ -108,7 +120,6 @@ class SpectrumWidget(QWidget):
         ax.grid(True, which='both', linestyle='--', alpha=0.5)
 
         # Force Positive Frequencies only (as requested)
-        # We check the data range first to be safe, but generally ZULF is viewed 0+
         ax.set_xlim(left=0)
         
         # Restore view if needed, or let autoscale handle it?
