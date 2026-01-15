@@ -6,14 +6,13 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QPushButton, QLabel, QFormLayout, 
     QGroupBox, QComboBox, QTextEdit, QFileDialog, QInputDialog
 )
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 
 from src.core.optimizer import ZulfOptimizer
 from src.config import OptimizerConfig
 from src.core.simulation_wrapper import ZulfSimulation
 from src.utils.loaders import load_experimental_and_config
 from src.ui.molecule_editor import JCouplingEditorDialog, parse_isotopes
+from src.ui.plotting import SpectrumWidget
 
 # ---------- Worker Thread ----------
 class OptimizationWorker(QThread):
@@ -27,10 +26,12 @@ class OptimizationWorker(QThread):
     finished = Signal(object, list)          # best_params, history
     failed = Signal(str)
 
-    def __init__(self, optimizer, init_params):
+    def __init__(self, optimizer, init_params, freq_range=None, variable_config=None):
         super().__init__()
         self.optimizer = optimizer
         self.init_params = init_params
+        self.freq_range = freq_range
+        self.variable_config = variable_config
         self._is_running = True
 
     def run(self):
@@ -40,7 +41,9 @@ class OptimizationWorker(QThread):
             # Run optimizer with callback
             best_params, history = self.optimizer.run(
                 *self.init_params, 
-                callback=self._step_callback
+                callback=self._step_callback,
+                freq_range=self.freq_range,
+                variable_config=self.variable_config
             )
             self.finished.emit(best_params, history)
         except Exception as e:
@@ -130,11 +133,26 @@ class OptimizationWindow(QMainWindow):
         self.spin_trunc.setValue(160)
         self.spin_trunc.setSingleStep(10)
 
+        # --- Frequency Range Inputs ---
+        self.spin_freq_min = QDoubleSpinBox()
+        self.spin_freq_min.setRange(0, 10000)
+        self.spin_freq_min.setValue(0)
+        self.spin_freq_min.setSingleStep(10)
+        self.spin_freq_min.setToolTip("Minimum frequency for cost calculation (Hz)")
+
+        self.spin_freq_max = QDoubleSpinBox()
+        self.spin_freq_max.setRange(0, 10000)
+        self.spin_freq_max.setValue(400) # Default Zulf range
+        self.spin_freq_max.setSingleStep(10)
+        self.spin_freq_max.setToolTip("Maximum frequency for cost calculation (Hz)")
+
         param_form.addRow("Max Iterations:", self.spin_steps)
         param_form.addRow("Plot Interval:", self.spin_plot_interval)
         param_form.addRow("Linewidth (Hz):", self.spin_t2)
         param_form.addRow("SG Window (pts):", self.spin_sg)
         param_form.addRow("Truncation (pts):", self.spin_trunc)
+        param_form.addRow("Freq Min (Hz):", self.spin_freq_min)
+        param_form.addRow("Freq Max (Hz):", self.spin_freq_max)
         
         param_group.setLayout(param_form)
         settings_layout.addWidget(param_group)
@@ -163,14 +181,9 @@ class OptimizationWindow(QMainWindow):
         plot_layout = QVBoxLayout(plot_panel)
         main_layout.addWidget(plot_panel)
         
-        # Matplotlib Canvas
-        self.figure = Figure(figsize=(5, 4), dpi=100)
-        self.canvas = FigureCanvas(self.figure)
-        plot_layout.addWidget(self.canvas)
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Optimization Progress")
-        self.ax.set_xlabel("Frequency (Hz)")
-        self.ax.set_ylabel("Intensity")
+        # Use Custom SpectrumWidget
+        self.plot_widget = SpectrumWidget(self)
+        plot_layout.addWidget(self.plot_widget)
         
         # Connect Signals
         self.btn_load_exp.clicked.connect(self.load_experiment)
@@ -185,6 +198,7 @@ class OptimizationWindow(QMainWindow):
         self.exp_fid = None      # array or None
         self.sampling_rate = None
         self.j_coupling = None
+        self.variable_config = None # New: Dict for variable params
         self.loaded_config = None
         self.best_viz_data = None
         self.best_params_result = None
@@ -213,11 +227,7 @@ class OptimizationWindow(QMainWindow):
                 self.log(f"Sampling Rate: {sr} Hz")
                 
                 # Plot
-                self.ax.clear()
-                self.ax.plot(self.exp_spectrum[0], self.exp_spectrum[1], 'k-', alpha=0.5, label='Experiment')
-                self.ax.legend()
-                self.ax.set_title("Experimental Data")
-                self.canvas.draw()
+                self.plot_widget.update_plot(self.exp_spectrum[0], self.exp_spectrum[1])
                 
             except Exception as e:
                 self.log(f"Error loading data: {e}")
@@ -242,8 +252,10 @@ class OptimizationWindow(QMainWindow):
                      if vals: j_data.append(vals)
                  
                  self.j_coupling = np.array(j_data)
+                 self.variable_config = None # Reset params
+                 
                  self.lbl_mol_status.setText(f"Loaded: {len(self.isotopes)} spins")
-                 self.log(f"Loaded molecule from {path}")
+                 self.log(f"Loaded molecule from {path}. Mode: Numeric")
              except Exception as e:
                  self.log(f"Error loading molecule: {e}")
 
@@ -273,11 +285,13 @@ class OptimizationWindow(QMainWindow):
             # 3. Retrieve Result
             self.isotopes = isotopes
             self.j_coupling = dlg.result_matrix
+            self.variable_config = dlg.variable_config
             
             n_spins = len(self.isotopes)
-            self.lbl_mol_status.setText(f"Manual: {n_spins} spins defined")
+            mode = "Variable Mode" if self.variable_config else "Numeric Mode"
+            self.lbl_mol_status.setText(f"Manual: {n_spins} spins ({mode})")
             self.log(f"System defined manually: {isotopes}")
-            self.log(f"J-Coupling Matrix updated ({n_spins}x{n_spins}).")
+            self.log(f"J-Coupling Matrix updated ({n_spins}x{n_spins}). Mode: {mode}")
 
     def start_optimization(self):
         if self.exp_spectrum is None or self.j_coupling is None:
@@ -328,8 +342,16 @@ class OptimizationWindow(QMainWindow):
                 config.t2_linewidth.initial_value
             )
             
+            # Get Frequency Range
+            f_min = self.spin_freq_min.value()
+            f_max = self.spin_freq_max.value()
+            freq_range = (f_min, f_max)
+
             # 5. Start Worker
-            self.worker = OptimizationWorker(self.optimizer, init_params)
+            # Pass variable_config if available
+            var_config = getattr(self, 'variable_config', None)
+            
+            self.worker = OptimizationWorker(self.optimizer, init_params, freq_range, var_config)
             self.worker.log.connect(self.log)
             self.worker.progress.connect(self.on_progress)
             self.worker.new_best.connect(self.on_new_best)
@@ -366,29 +388,18 @@ class OptimizationWindow(QMainWindow):
         # Real-time Plotting
         if viz_data:
             try:
-                self.ax.clear()
-                
                 # Extract Data
                 sim_freq = viz_data['sim_freq']
                 sim_amp = viz_data['sim_amp']
                 exp_freq = viz_data['exp_freq']
                 exp_amp = viz_data['exp_amp']
                 
-                # Plot Experimental (Black)
-                self.ax.plot(exp_freq, exp_amp, 'k-', alpha=0.6, label='Experiment')
-                
-                # Plot Simulated (Red Dashed)
-                # Auto-scaling if sim amplitude is arbitrary vs exp
-                if np.max(sim_amp) > 0 and np.max(exp_amp) > 0:
-                    scale = np.max(exp_amp) / np.max(sim_amp)
-                    self.ax.plot(sim_freq, sim_amp * scale, 'r--', label='Simulated (Best)')
-                else:
-                    self.ax.plot(sim_freq, sim_amp, 'r--', label='Simulated (Best)')
-                    
-                self.ax.set_title(f"Optimization Progress (Iter {iteration}, Cost {cost:.2f})")
-                self.ax.set_xlabel("Frequency (Hz)")
-                self.ax.legend()
-                self.canvas.draw()
+                # Update Custom Widget
+                self.plot_widget.update_plot(
+                    exp_freq, exp_amp, 
+                    sim_freq, sim_amp, 
+                    cost=cost, iter_num=iteration
+                )
                 
             except Exception as e:
                 print(f"Plotting error: {e}")

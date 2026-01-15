@@ -3,12 +3,85 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
-    QLabel, QLineEdit, QPushButton, QScrollArea, QMessageBox
+    QLabel, QLineEdit, QPushButton, QScrollArea, QMessageBox,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 
 def parse_isotopes(text):
     """Parse isotopes from comma-separated text"""
     return [s.strip() for s in text.replace('\n', ',').split(',') if s.strip()]
+
+class VariableConfigDialog(QDialog):
+    """Dialog to configure optimization parameters for variables."""
+    def __init__(self, variables, parent=None):
+        super().__init__(parent)
+        self.variables = sorted(list(variables))
+        self.config_data = {}
+        self.setWindowTitle("Configure Variables")
+        self.resize(800, 400)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Header
+        layout.addWidget(QLabel("<b>Configure Optimization Parameters for Variables</b>"))
+        
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Variable", "Initial Value", "Min", "Max", "Step Size", "Penalty Wt"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setRowCount(len(self.variables))
+        
+        for i, var in enumerate(self.variables):
+            self.table.setItem(i, 0, QTableWidgetItem(var))
+            self.table.item(i, 0).setFlags(Qt.ItemIsEnabled) # Read only label
+
+            # Defaults
+            self.table.setItem(i, 1, QTableWidgetItem("10.0")) # Init
+            self.table.setItem(i, 2, QTableWidgetItem("-500.0")) # Min
+            self.table.setItem(i, 3, QTableWidgetItem("500.0")) # Max
+            self.table.setItem(i, 4, QTableWidgetItem("0.5")) # Step
+            self.table.setItem(i, 5, QTableWidgetItem("0.0")) # Elasticity
+            
+        layout.addWidget(self.table)
+        
+        # Buttons
+        btns = QHBoxLayout()
+        ok_btn = QPushButton("Confirm")
+        ok_btn.clicked.connect(self.save)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(ok_btn)
+        layout.addLayout(btns)
+        
+    def save(self):
+        try:
+            config = {}
+            for i in range(self.table.rowCount()):
+                var = self.table.item(i, 0).text()
+                init = float(self.table.item(i, 1).text())
+                min_v = float(self.table.item(i, 2).text())
+                max_v = float(self.table.item(i, 3).text())
+                step = float(self.table.item(i, 4).text())
+                elas = float(self.table.item(i, 5).text())
+                
+                config[var] = {
+                    "initial_value": init,
+                    "min_value": min_v,
+                    "max_value": max_v,
+                    "step_size": step,
+                    "elasticity": elas
+                }
+            self.config_data = config
+            self.accept()
+        except ValueError:
+            QMessageBox.warning(self, "Error", "All fields must be valid numbers.")
+
+    def get_config(self):
+        return self.config_data
 
 class JCouplingEditorDialog(QDialog):
     """
@@ -33,6 +106,8 @@ class JCouplingEditorDialog(QDialog):
 
         self.grid_inputs = {}  # Store input widgets {(i, j): QLineEdit}
         self.result_matrix = None # Will store the final numpy array upon Apply
+        self.variable_config = None # Store variable config if present
+
         
         self.setWindowTitle("J-Coupling Editor")
         
@@ -136,18 +211,38 @@ class JCouplingEditorDialog(QDialog):
 
     def apply_changes(self):
         """Construct symmetric matrix and accept."""
+        # Detect variables vs numbers
+        template = np.zeros((self.n_spins, self.n_spins), dtype=object)
+        variables = set()
+        
         try:
-            mat = np.zeros((self.n_spins, self.n_spins))
-            
             for (i, j), inp in self.grid_inputs.items():
                 txt = inp.text().strip()
                 if not txt: txt = "0"
-                val = float(txt)
-                mat[i, j] = val
-                mat[j, i] = val # Symmetric
                 
-            self.result_matrix = mat
-            self.accept()
-        except ValueError:
-            QMessageBox.warning(self, "Invalid Input", "Please ensure all J-couplings are numeric.")
+                try:
+                    val = float(txt)
+                    template[i, j] = val
+                    template[j, i] = val
+                except ValueError:
+                    # It's a variable
+                    variables.add(txt)
+                    template[i, j] = txt
+                    template[j, i] = txt # Symmetric
+            
+            if not variables:
+                # Pure Numeric Mode (Legacy)
+                self.result_matrix = template.astype(float)
+                self.variable_config = None
+                self.accept()
+            else:
+                # Variable Mode
+                dlg = VariableConfigDialog(list(variables), self)
+                if dlg.exec():
+                    self.variable_config = dlg.get_config()
+                    self.result_matrix = template # Keep as object array
+                    self.accept()
+                    
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"An error occurred: {e}")
 
