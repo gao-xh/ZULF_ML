@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QDoubleSpinBox, QSpinBox, QPushButton, QLabel, QFormLayout, 
-    QGroupBox, QComboBox, QTextEdit, QFileDialog
+    QGroupBox, QComboBox, QTextEdit, QFileDialog, QInputDialog
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -13,6 +13,7 @@ from src.core.optimizer import ZulfOptimizer
 from src.config import OptimizerConfig
 from src.core.simulation_wrapper import ZulfSimulation
 from src.utils.loaders import load_experimental_and_config
+from src.ui.molecule_editor import JCouplingEditorDialog, parse_isotopes
 
 # ---------- Worker Thread ----------
 class OptimizationWorker(QThread):
@@ -90,10 +91,12 @@ class OptimizationWindow(QMainWindow):
         self.btn_load_exp = QPushButton("Load Experiment Data")
         self.lbl_exp_status = QLabel("No data loaded")
         self.btn_load_mol = QPushButton("Load Molecule Structure")
+        self.btn_top_sys = QPushButton("Define System Manually")  # New Button
         self.lbl_mol_status = QLabel("No molecule loaded")
         
         data_form.addRow(self.btn_load_exp, self.lbl_exp_status)
         data_form.addRow(self.btn_load_mol, self.lbl_mol_status)
+        data_form.addRow(self.btn_top_sys, QLabel("(Or build manually)"))
         data_group.setLayout(data_form)
         settings_layout.addWidget(data_group)
         
@@ -172,6 +175,7 @@ class OptimizationWindow(QMainWindow):
         # Connect Signals
         self.btn_load_exp.clicked.connect(self.load_experiment)
         self.btn_load_mol.clicked.connect(self.load_molecule)
+        self.btn_top_sys.clicked.connect(self.open_system_builder)
         self.btn_start.clicked.connect(self.start_optimization)
         self.btn_stop.clicked.connect(self.stop_optimization)
         self.btn_save.clicked.connect(self.save_results)
@@ -242,6 +246,38 @@ class OptimizationWindow(QMainWindow):
                  self.log(f"Loaded molecule from {path}")
              except Exception as e:
                  self.log(f"Error loading molecule: {e}")
+
+    def open_system_builder(self):
+        """Open the manual J-Coupling Editor dialog."""
+        # 1. Ask for Isotopes
+        text, ok = QInputDialog.getText(
+            self, "Define System", 
+            "Enter isotopes (comma separated, e.g. 1H, 13C, 1H):"
+        )
+        if not ok or not text.strip():
+            return
+            
+        isotopes = parse_isotopes(text)
+        if not isotopes:
+            self.log("No valid isotopes entered.")
+            return
+            
+        # 2. Open Editor
+        # Pass current j_coupling if size matches, else None
+        current_j = None
+        if self.j_coupling is not None and self.j_coupling.shape[0] == len(isotopes):
+            current_j = self.j_coupling
+            
+        dlg = JCouplingEditorDialog(isotopes, current_j, self)
+        if dlg.exec():
+            # 3. Retrieve Result
+            self.isotopes = isotopes
+            self.j_coupling = dlg.result_matrix
+            
+            n_spins = len(self.isotopes)
+            self.lbl_mol_status.setText(f"Manual: {n_spins} spins defined")
+            self.log(f"System defined manually: {isotopes}")
+            self.log(f"J-Coupling Matrix updated ({n_spins}x{n_spins}).")
 
     def start_optimization(self):
         if self.exp_spectrum is None or self.j_coupling is None:
