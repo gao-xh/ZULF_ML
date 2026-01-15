@@ -12,6 +12,7 @@ from matplotlib.figure import Figure
 from src.core.optimizer import ZulfOptimizer
 from src.config import OptimizerConfig
 from src.core.simulation_wrapper import ZulfSimulation
+from src.utils.loaders import load_experimental_and_config
 
 # ---------- Worker Thread ----------
 class OptimizationWorker(QThread):
@@ -156,7 +157,9 @@ class OptimizationWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_optimization)
 
         # Internal State
-        self.exp_data = None  # (freq, spec)
+        self.exp_spectrum = None # (freq, amp)
+        self.exp_fid = None      # array or None
+        self.sampling_rate = None
         self.j_coupling = None
         self.loaded_config = None
 
@@ -164,23 +167,31 @@ class OptimizationWindow(QMainWindow):
         self.text_log.append(message)
 
     def load_experiment(self):
-        # Placeholder for loading logic (csv/json)
-        # Using QFileDialog
-        path, _ = QFileDialog.getOpenFileName(self, "Open Spectrum CSV", "", "CSV Files (*.csv)")
-        if path:
+        # We need to select a FOLDER now, because of NMRduino format (multiple files)
+        # or legacy format (spectrum.csv + setting.json)
+        folder = QFileDialog.getExistingDirectory(self, "Select Experiment Data Folder")
+        if folder:
             try:
-                # Load logic here or use main.py helper
-                data = np.loadtxt(path, delimiter=',')
-                if data.shape[1] < 2:
-                    raise ValueError("CSV must have at least 2 columns")
-                self.exp_data = (data[:,0], data[:,1])
-                self.lbl_exp_status.setText(f"Loaded: {len(self.exp_data[0])} pts")
-                self.log(f"Loaded experiment data from {path}")
+                (spectrum, fid), sr, _, _ = load_experimental_and_config(folder)
                 
-                # Initial plot
-                self.ax.plot(self.exp_data[0], self.exp_data[1], 'k-', alpha=0.5, label='Experiment')
+                self.exp_spectrum = spectrum
+                self.exp_fid = fid
+                self.sampling_rate = sr
+                
+                sp_len = len(spectrum[0]) if spectrum else 0
+                fid_len = len(fid) if fid is not None else 0
+                
+                self.lbl_exp_status.setText(f"Spectrum: {sp_len} pts | FID: {fid_len} pts")
+                self.log(f"Loaded data from {folder}")
+                self.log(f"Sampling Rate: {sr} Hz")
+                
+                # Plot
+                self.ax.clear()
+                self.ax.plot(self.exp_spectrum[0], self.exp_spectrum[1], 'k-', alpha=0.5, label='Experiment')
                 self.ax.legend()
+                self.ax.set_title("Experimental Data")
                 self.canvas.draw()
+                
             except Exception as e:
                 self.log(f"Error loading data: {e}")
 
@@ -210,7 +221,7 @@ class OptimizationWindow(QMainWindow):
                  self.log(f"Error loading molecule: {e}")
 
     def start_optimization(self):
-        if self.exp_data is None or self.j_coupling is None:
+        if self.exp_spectrum is None or self.j_coupling is None:
             self.log("Error: Please load both Experiment Data and Molecule Structure.")
             return
 
@@ -226,15 +237,16 @@ class OptimizationWindow(QMainWindow):
             spins = getattr(self, 'isotopes', ['1H'] * self.j_coupling.shape[0])
             
             # Estimate Sampling Rate (Sweep)
-            exp_freq, exp_amp = self.exp_data
-            sweep = float(np.max(exp_freq)) if len(exp_freq) > 0 else 400.0
+            # Use loaded sampling rate if available
+            sr = self.sampling_rate if self.sampling_rate else 400.0
             
             # 3. Instantiate Optimizer
             try:
                 self.optimizer = ZulfOptimizer(
                     spins=spins,
-                    sampling_rate=sweep,
-                    exp_spectrum=self.exp_data
+                    sampling_rate=sr,
+                    exp_spectrum=self.exp_spectrum,
+                    exp_fid=self.exp_fid
                 )
             except Exception as e:
                 self.log(f"Optimizer instantiation failed: {e}")

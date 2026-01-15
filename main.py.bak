@@ -1,0 +1,281 @@
+import sys
+import os
+
+import sys
+import os
+
+# Add src directory and references to path
+import sys, os
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(project_root, 'src'))
+# Add ZULF Suite to path (crucial for it to find its own modules)
+zulf_suite_path = os.path.join(project_root, 'references', 'ZULF_NMR_Suite')
+sys.path.append(zulf_suite_path)
+
+import numpy as np
+from src.core.optimizer import ZulfOptimizer
+from src.config import OPTIMIZER_CONFIG, SIMULATION_CONFIG
+
+def generate_mock_data():
+    """Generate mock experimental FID for testing."""
+    # True Params
+    true_j = np.array([
+        [0, 140],
+        [140, 0]
+    ])
+    spins = ['1H', '13C']
+    sampling_rate = 2000 # Hz
+    duration = 1.0 # sec
+    
+    # Simulate Spectrum directly for now as we don't have FID simulator in simulation.py yet
+    # But wait, optimizer expects FID.
+    # Let's mock a simple FID.
+    t = np.linspace(0, duration, int(sampling_rate * duration))
+    # Signal: sum of cos(2pi f t)
+    # J=140 Hz (scalar coupling), in zero field usually gives lines at J, 3J/2 etc. dependent on system. 
+    # For AX system (which 1H-13C is approx at ZF? No, strongly coupled).
+    # Let's just create a dummy FID with some frequencies.
+    frequencies = [140.0, 210.0] 
+    fid = np.zeros_like(t, dtype=complex)
+    for f in frequencies:
+        fid += np.exp(1j * 2 * np.pi * f * t) * np.exp(-t/0.5) # Decay T2=0.5s
+        
+    return fid, sampling_rate, spins, true_j
+
+def load_experimental_and_config(folder_path):
+    """
+    Load experimental data (spectrum.csv) and config (setting.json) from a folder.
+    Matches the format used by the reference ZULF Suite Save/Load module.
+    
+    Args:
+        folder_path (str): Path to the folder containing spectrum.csv and setting.json.
+        
+    Returns:
+        exp_spectrum (tuple): (freq_axis, amp_axis) numpy arrays.
+        sampling_rate (float): Sampling rate derived from settings or data.
+        spins (list): List of isotopes (e.g. ['1H', '13C']) - derived or default.
+        init_j (np.ndarray): Initial J-coupling guess - derived or default.
+    """
+    import csv
+    import json
+    
+    print(f"Loading data from: {folder_path}")
+    
+    spectrum_path = os.path.join(folder_path, 'spectrum.csv')
+    setting_path = os.path.join(folder_path, 'setting.json')
+    
+    if not os.path.exists(spectrum_path):
+        raise FileNotFoundError(f"spectrum.csv not found in {folder_path}")
+    if not os.path.exists(setting_path):
+        raise FileNotFoundError(f"setting.json not found in {folder_path}")
+        
+    # 1. Load Settings
+    with open(setting_path, 'r', encoding='utf-8') as f:
+        settings = json.load(f)
+        
+    # Extract relevant params
+    # Note: 'sweep' roughly defines max freq.
+    # We need Sampling Rate. Usually sampling_rate = 2 * sweep or explicit.
+    # Looking at simulation_window.py, par_obj.sweep(self.sweep) is used.
+    # But for optimization we assume data is already FFT'd.
+    
+    # Try to extract isotopes if stored in settings? 
+    # Usually settings have 'isotopes' key or similar for simulation settings.
+    # If experimental settings, maybe not.
+    # Let's check keys if possible, but for now default to PROTON/CARBON.
+    # User can override in code if needed.
+    
+    # Defaults
+    spins = ['1H', '13C'] 
+    if 'isotopes' in settings:
+         spins = settings['isotopes']
+    elif 'spins' in settings:
+         spins = settings['spins']
+         
+    # 2. Load Spectrum CSV
+    # Format: Header line, then "Freq, Real, Imag" or similar?
+    # Save_Load says "2D list", usually [[freq, intensity], ...]
+    freqs = []
+    amps = []
+    
+    with open(spectrum_path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        header = next(reader, None) # Skip header
+        for row in reader:
+            if len(row) >= 2:
+                try:
+                    f_val = float(row[0])
+                    a_val = float(row[1])
+                    freqs.append(f_val)
+                    amps.append(a_val)
+                except ValueError:
+                    continue
+                    
+    freqs = np.array(freqs)
+    amps = np.array(amps)
+    
+    # Sort just in case
+    sort_idx = np.argsort(freqs)
+    freqs = freqs[sort_idx]
+    amps = amps[sort_idx]
+    
+    # Derive sampling rate if needed (2 * max_freq)
+    max_freq = freqs.max()
+    sampling_rate = 2 * max_freq
+    
+    # Initial J Guess
+    # If not provided, start from 0 or small J
+    n_spins = len(spins)
+    init_j = np.zeros((n_spins, n_spins))
+    # Dummy non-zero off-diagonals
+    for i in range(n_spins):
+        for j in range(i+1, n_spins):
+            init_j[i,j] = 100.0 # Blind guess
+            init_j[j,i] = 100.0
+            
+    return (freqs, amps), sampling_rate, spins, init_j
+
+def load_molecule_from_csv(path):
+    """
+    Load molecule structure (structure.csv) to get isotopes and J-couplings.
+    Format:
+        Row 0: 1H, 13C, ...
+        Row 1+: J-matrix rows
+    """
+    import csv
+    print(f"Loading molecule from: {path}")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Molecule file not found: {path}")
+        
+    with open(path, 'r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        rows = [row for row in reader]
+        
+    if not rows:
+        raise ValueError("Empty molecule file")
+
+    # Row 0: Isotopes
+    isotopes = [iso.strip() for iso in rows[0] if iso.strip()]
+    
+    # Rows 1+: J Matrix
+    j_matrix = []
+    for row in rows[1:]:
+        clean_row = [x for x in row if x.strip() != '']
+        if clean_row:
+             j_matrix.append(list(map(float, clean_row)))
+             
+    j_matrix = np.array(j_matrix)
+    
+    if len(isotopes) != j_matrix.shape[0]:
+         print(f"Warning: Isotope count ({len(isotopes)}) != J-matrix size ({j_matrix.shape})")
+         
+    return isotopes, j_matrix
+
+def main():
+    print("Starting ML_ZULF project - ZULF Optimizer...")
+    
+    # --- CONFIGURATION SECTION ---
+    
+    # 1. Experimental Data Path 
+    #    (Folder containing spectrum.csv and setting.json)
+    data_folder = os.path.join(project_root, 'data', 'experimental_1')
+    
+    # 2. Molecule Definition (System Input)
+    #    Option A: Load from structure.csv (Standard ZULF Suite Format)
+    #    Option B: Define Manually below
+    molecule_file = None # e.g. os.path.join(project_root, 'data', 'molecule', 'structure.csv')
+    
+    #    Manual Input (fallback if file is None)
+    manual_spins = ['1H', '13C']
+    manual_j = np.array([
+        [0.0, 140.0],
+        [140.0, 0.0]
+    ])
+    
+    # --- END CONFIGURATION ---
+    
+    # Check command line args (override data folder)
+    if len(sys.argv) > 1:
+        potential_path = sys.argv[1]
+        if os.path.exists(potential_path):
+             data_folder = potential_path
+
+    # 1. Load Data
+    use_real_data = False
+    if os.path.exists(data_folder) and (os.path.exists(os.path.join(data_folder, 'spectrum.csv')) or os.path.exists(os.path.join(data_folder, 'spectrum.txt'))):
+        print("1. Loading Real Experimental Data...")
+        # Note: load_experimental_and_config is defined above but we might need to be robust
+        try:
+            exp_spectrum, sampling_rate, _, _ = load_experimental_and_config(data_folder)
+            use_real_data = True
+            exp_fid = None
+            print(f"   Spectrum loaded: {len(exp_spectrum[0])} points")
+        except Exception as e:
+            print(f"   Error loading data: {e}")
+
+    if not use_real_data:
+        print("1. Generating Mock Data (Fallback)...")
+        exp_fid, sampling_rate, _, true_j_mock = generate_mock_data()
+        exp_spectrum = None
+        # Mock implies we know the "Truth" for comparison
+        print(f"   Mock Data generated (Target J={true_j_mock[0,1]}Hz)")
+
+    # 2. Define System (Isotopes & Initial J)
+    print("2. Defining System...")
+    spins = []
+    init_j = None
+    
+    if molecule_file and os.path.exists(molecule_file):
+        try:
+            spins, init_j = load_molecule_from_csv(molecule_file)
+            print(f"   Loaded from file: {spins}")
+        except Exception as e:
+             print(f"   Failed to load molecule: {e}")
+    
+    if init_j is None:
+        if use_real_data:
+             # Use Manual Input
+             spins = manual_spins
+             init_j = manual_j
+             print(f"   Using Manual Configuration: {spins}")
+             print(f"   Initial J:\n{init_j}")
+        else:
+             # Use Mock Setup defaults
+             spins = ['1H', '13C']
+             init_j = np.array([[0, 100.0], [100.0, 0]]) # Start far from true 140
+             print(f"   Using Mock Configuration: {spins}")
+
+    # 3. Setup Optimizer
+    print("3. Setting up Optimizer...")
+    optimizer = ZulfOptimizer(
+        exp_fid=exp_fid,
+        exp_spectrum=exp_spectrum,
+        sampling_rate=sampling_rate,
+        spins=spins
+    )
+    
+    # 4. Run Optimization
+    # Initial Guess for other params
+    init_sg = 5
+    init_trunc = 1000 
+    if exp_fid is not None: init_trunc = len(exp_fid)
+    init_t2 = 1.0
+    
+    print("4. Starting Random Walk Optimization...")
+    best_params, history = optimizer.run(init_j, init_sg, init_trunc, init_t2)
+    
+    best_j, best_sg, best_trunc, best_t2 = best_params
+    
+    print("-" * 30)
+    print("Optimization Complete.")
+    print(f"Best J:\n{best_j}")
+    print(f"Best SG: {best_sg}")
+    print(f"Best T2: {best_t2:.4f}")
+    print("-" * 30)
+    
+    # 5. Visualization
+    print("5. Generating Comparison Plot...")
+    optimizer.plot_comparison(save_path="optimization_result.png")
+
+if __name__ == "__main__":
+    main()

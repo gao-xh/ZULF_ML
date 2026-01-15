@@ -19,9 +19,10 @@ def run_cli(args):
     # 1. Load Data
     if args.data and os.path.exists(args.data):
         try:
-            exp_spectrum, sampling_rate, _, _ = load_experimental_and_config(args.data)
+            (exp_spectrum, exp_fid), sampling_rate, _, _ = load_experimental_and_config(args.data)
             print(f"Loaded Experimental Data: {args.data}")
-            exp_fid = None
+            if exp_fid is not None:
+                print("   (Using FID data)")
         except Exception as e:
             print(f"Error loading data: {e}")
             return
@@ -47,7 +48,8 @@ def run_cli(args):
     optimizer = ZulfOptimizer(
         spins=spins,
         sampling_rate=sampling_rate,
-        exp_spectrum=exp_spectrum
+        exp_spectrum=exp_spectrum,
+        exp_fid=exp_fid
     )
     
     # 4. Run
