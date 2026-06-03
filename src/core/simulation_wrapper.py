@@ -2,7 +2,9 @@ import sys
 import os
 import numpy as np
 import importlib.util
-from typing import Tuple, List, Optional
+from abc import ABC, abstractmethod
+from typing import Dict, Tuple, List
+from scipy.linalg import expm
 
 # --- Dynamic Import of spinach_bridge from References ---
 # This allows us to use the reference implementation without copying it
@@ -30,9 +32,93 @@ except Exception as e:
     print(f"Warning: Unexpected error loading spinach_bridge: {e}")
 
 
-class ZulfSimulation:
+class SimulationBackend(ABC):
+    name = "base"
+
+    @abstractmethod
+    def simulate_spectrum(self,
+                          j_coupling_matrix: np.ndarray,
+                          isotopes: List[str] = None,
+                          t2_linewidth: float = 1.0,
+                          field: float = 0.0,
+                          sweep: float = 400.0,
+                          npoints: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+
+class QuantumSimulationMixin:
+    GAMMA_BY_ISOTOPE: Dict[str, float] = {
+        '1H': 42.58,
+        '13C': 10.71,
+        '15N': 60.86,
+    }
+
+    def _validate_isotopes(self, j_coupling_matrix: np.ndarray, isotopes: List[str] = None) -> List[str]:
+        n_spins = j_coupling_matrix.shape[0]
+        if isotopes is None:
+            isotopes = ['1H'] * n_spins
+        if len(isotopes) != n_spins:
+            raise ValueError(f"Number of isotopes ({len(isotopes)}) does not match matrix size ({n_spins})")
+        return isotopes
+
+    def _gamma_array(self, isotopes: List[str]) -> np.ndarray:
+        gamma = []
+        for isotope in isotopes:
+            if isotope not in self.GAMMA_BY_ISOTOPE:
+                raise ValueError(f"Unsupported isotope for python backend: {isotope}")
+            gamma.append(self.GAMMA_BY_ISOTOPE[isotope])
+        return np.asarray(gamma, dtype=float)
+
+    def _single_spin_operators(self, n_spins: int):
+        p_x = np.array([[0.0, 0.5], [0.5, 0.0]], dtype=complex)
+        p_y = np.array([[0.0, -0.5j], [0.5j, 0.0]], dtype=complex)
+        p_z = np.array([[0.5, 0.0], [0.0, -0.5]], dtype=complex)
+        identity = np.eye(2, dtype=complex)
+
+        def kron_for_spin(target_index: int, operator: np.ndarray) -> np.ndarray:
+            result = np.eye(1, dtype=complex)
+            for spin_index in range(n_spins):
+                result = np.kron(result, operator if spin_index == target_index else identity)
+            return result
+
+        i_x = [kron_for_spin(index, p_x) for index in range(n_spins)]
+        i_y = [kron_for_spin(index, p_y) for index in range(n_spins)]
+        i_z = [kron_for_spin(index, p_z) for index in range(n_spins)]
+        return i_x, i_y, i_z
+
+    def _hamiltonian_terms(self, j_coupling_matrix: np.ndarray, isotopes: List[str], field: float):
+        n_spins = j_coupling_matrix.shape[0]
+        gamma = self._gamma_array(isotopes)
+        i_x, i_y, i_z = self._single_spin_operators(n_spins)
+        hamiltonian = np.zeros((2 ** n_spins, 2 ** n_spins), dtype=complex)
+
+        for spin_index in range(n_spins):
+            hamiltonian += 2 * np.pi * gamma[spin_index] * field * i_z[spin_index]
+
+        for row in range(n_spins):
+            for col in range(row + 1, n_spins):
+                coupling = j_coupling_matrix[row, col]
+                hamiltonian += 2 * np.pi * coupling * (
+                    i_x[row] @ i_x[col] +
+                    i_y[row] @ i_y[col] +
+                    i_z[row] @ i_z[col]
+                )
+
+        detector = np.zeros_like(hamiltonian)
+        rho0 = np.zeros_like(hamiltonian)
+        for spin_index in range(n_spins):
+            detector += 2 * np.pi * gamma[spin_index] * i_x[spin_index]
+            rho0 += 2 * np.pi * gamma[spin_index] * i_x[spin_index]
+
+        return hamiltonian, detector, rho0
+
+
+class SpinachSimulationBackend(SimulationBackend):
+    name = "spinach"
+
     def __init__(self):
         self.engine = None
+        self.cm = None
         if spinach_bridge is None:
             print("Error: spinach_bridge module is not loaded. Simulation will fail.")
 
@@ -150,14 +236,105 @@ class ZulfSimulation:
         except:
             return False
 
-# Global instance for easier import
-zulf_sim = ZulfSimulation()
 
-def simulate_spectrum(*args, **kwargs):
+class FastEigenSpectrumBackend(QuantumSimulationMixin, SimulationBackend):
+    name = "fast_eigen"
+
+    def simulate_spectrum(self,
+                          j_coupling_matrix: np.ndarray,
+                          isotopes: List[str] = None,
+                          t2_linewidth: float = 1.0,
+                          field: float = 0.0,
+                          sweep: float = 400.0,
+                          npoints: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+        isotopes = self._validate_isotopes(j_coupling_matrix, isotopes)
+        if npoints <= 1:
+            raise ValueError("npoints must be greater than 1")
+
+        hamiltonian, detector, _ = self._hamiltonian_terms(j_coupling_matrix, isotopes, field)
+        eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian)
+        detector_eig = eigenvectors.conj().T @ detector @ eigenvectors
+
+        freq_axis = np.linspace(-sweep / 2.0, sweep / 2.0, npoints)
+        amplitude = np.zeros_like(freq_axis, dtype=float)
+        linewidth = max(float(t2_linewidth), 1e-3)
+
+        for row in range(len(eigenvalues)):
+            for col in range(row + 1, len(eigenvalues)):
+                transition = abs(eigenvalues[col] - eigenvalues[row]) / (2 * np.pi)
+                if transition > sweep / 2.0:
+                    continue
+                weight = abs(detector_eig[row, col]) ** 2
+                if weight <= 0:
+                    continue
+                line = (linewidth ** 2) / ((freq_axis - transition) ** 2 + linewidth ** 2)
+                amplitude += weight * line
+                if transition > 0:
+                    mirrored_line = (linewidth ** 2) / ((freq_axis + transition) ** 2 + linewidth ** 2)
+                    amplitude += weight * mirrored_line
+
+        return freq_axis, amplitude
+
+
+class PythonFidSimulationBackend(QuantumSimulationMixin, SimulationBackend):
+    name = "python_fid"
+
+    def simulate_spectrum(self,
+                          j_coupling_matrix: np.ndarray,
+                          isotopes: List[str] = None,
+                          t2_linewidth: float = 1.0,
+                          field: float = 0.0,
+                          sweep: float = 400.0,
+                          npoints: int = 2048) -> Tuple[np.ndarray, np.ndarray]:
+        isotopes = self._validate_isotopes(j_coupling_matrix, isotopes)
+        if npoints <= 1:
+            raise ValueError("npoints must be greater than 1")
+        if sweep <= 0:
+            raise ValueError("sweep must be positive")
+
+        sampling_rate = sweep
+        time_step = 1.0 / sampling_rate
+        hamiltonian, detector, rho = self._hamiltonian_terms(j_coupling_matrix, isotopes, field)
+        propagator = expm(-1j * hamiltonian * time_step)
+        propagator_dagger = propagator.conj().T
+
+        fid = np.zeros(npoints, dtype=complex)
+        decay_rate = max(float(t2_linewidth), 1e-3)
+
+        for index in range(npoints):
+            time_value = index * time_step
+            fid[index] = np.trace(rho @ detector) * np.exp(-time_value * decay_rate)
+            rho = propagator @ rho @ propagator_dagger
+
+        spectrum = np.fft.fftshift(np.fft.fft(fid))
+        freq_axis = np.fft.fftshift(np.fft.fftfreq(npoints, d=time_step))
+        amplitude = np.abs(spectrum)
+        return freq_axis, amplitude
+
+
+_BACKENDS = {
+    SpinachSimulationBackend.name: SpinachSimulationBackend(),
+    FastEigenSpectrumBackend.name: FastEigenSpectrumBackend(),
+    PythonFidSimulationBackend.name: PythonFidSimulationBackend(),
+}
+
+
+def available_backends() -> List[str]:
+    return sorted(_BACKENDS.keys())
+
+
+def get_backend(name: str) -> SimulationBackend:
+    if name not in _BACKENDS:
+        available = ', '.join(available_backends())
+        raise ValueError(f"Unknown simulation backend '{name}'. Available backends: {available}")
+    return _BACKENDS[name]
+
+
+def simulate_spectrum(*args, backend_name: str = 'spinach', **kwargs):
     """
-    Wrapper function to forward calls to the ZulfSimulation instance.
-    Usage: simulate_spectrum(j_coupling_matrix=..., isotopes=..., ...)
+    Forward calls to the requested simulation backend.
     """
-    return zulf_sim.simulate_spectrum(*args, **kwargs)
+    backend = get_backend(backend_name)
+    return backend.simulate_spectrum(*args, **kwargs)
 
 

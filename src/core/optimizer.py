@@ -1,13 +1,21 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import copy
 from .simulation_wrapper import simulate_spectrum
 from ..processing.signal import apply_processing, get_spectrum_from_fid
 from .cost import total_cost
 import matplotlib.pyplot as plt
-from ..config import OPTIMIZER_CONFIG, SIMULATION_CONFIG
+from ..config import (
+    OPTIMIZER_CONFIG,
+    SIMULATION_CONFIG,
+    optimizer_config_from_dict,
+    optimizer_config_to_dict,
+)
 
 class ZulfOptimizer:
-    def __init__(self, spins, sampling_rate, exp_fid=None, exp_spectrum=None):
+    def __init__(self, spins, sampling_rate, exp_fid=None, exp_spectrum=None, backend_name=None):
         """
         Args:
             spins (list): List of spins e.g. ['1H', '13C'].
@@ -19,6 +27,7 @@ class ZulfOptimizer:
         self.exp_spectrum = exp_spectrum
         self.sampling_rate = sampling_rate
         self.spins = spins
+        self.backend_name = backend_name or SIMULATION_CONFIG.backend_name
         
         if self.exp_fid is None and self.exp_spectrum is None:
              raise ValueError("Must provide either exp_fid or exp_spectrum.")
@@ -28,6 +37,167 @@ class ZulfOptimizer:
         self.history = []
         self.best_params = None
         self.best_cost = float('inf')
+        self.stage_history = []
+        self.current_params = None
+        self.completed_iterations = 0
+        self.current_stage_name = None
+        self.last_freq_range = None
+        self.initial_params = None
+        self.variable_config = None
+
+    def set_backend(self, backend_name):
+        self.backend_name = backend_name
+
+    def get_checkpoint_payload(self):
+        if self.current_params is None:
+            raise ValueError("No optimizer state is available for checkpointing.")
+        if self.variable_config:
+            raise NotImplementedError("Checkpoint save is currently supported only for numeric-mode optimization.")
+
+        current_j, current_sg, current_trunc, current_t2 = self.current_params
+        best_j, best_sg, best_trunc, best_t2 = self.best_params if self.best_params is not None else self.current_params
+
+        metadata = {
+            'spins': list(self.spins),
+            'sampling_rate': float(self.sampling_rate),
+            'backend_name': self.backend_name,
+            'completed_iterations': int(self.completed_iterations),
+            'current_cost': float(self.history[-1]) if self.history else float(self.best_cost),
+            'best_cost': float(self.best_cost),
+            'current_stage_name': self.current_stage_name,
+            'freq_range': None if self.last_freq_range is None else [
+                None if value is None else float(value) for value in self.last_freq_range
+            ],
+            'current_discrete_params': [int(current_sg), int(current_trunc), float(current_t2)],
+            'best_discrete_params': [int(best_sg), int(best_trunc), float(best_t2)],
+            'config': optimizer_config_to_dict(self.config),
+        }
+
+        arrays = {
+            'current_j': np.asarray(current_j),
+            'best_j': np.asarray(best_j),
+            'history': np.asarray(self.history, dtype=float),
+            'stage_history': np.asarray(self.stage_history, dtype='U32'),
+        }
+
+        if self.initial_params is not None:
+            arrays['initial_j'] = np.asarray(self.initial_params[0])
+            metadata['initial_discrete_params'] = [
+                int(self.initial_params[1]),
+                int(self.initial_params[2]),
+                float(self.initial_params[3]),
+            ]
+
+        if self.exp_fid is not None:
+            arrays['exp_fid'] = np.asarray(self.exp_fid)
+        if self.exp_spectrum is not None:
+            arrays['exp_freq'] = np.asarray(self.exp_spectrum[0])
+            arrays['exp_amp'] = np.asarray(self.exp_spectrum[1])
+
+        return metadata, arrays
+
+    def save_checkpoint(self, file_path):
+        metadata, arrays = self.get_checkpoint_payload()
+        target_path = Path(file_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(target_path, metadata=np.array(json.dumps(metadata)), **arrays)
+
+    @staticmethod
+    def load_checkpoint(file_path):
+        with np.load(file_path, allow_pickle=True) as data:
+            metadata = json.loads(str(data['metadata']))
+            state = {
+                'spins': metadata['spins'],
+                'sampling_rate': float(metadata['sampling_rate']),
+                'backend_name': metadata['backend_name'],
+                'completed_iterations': int(metadata['completed_iterations']),
+                'current_cost': float(metadata['current_cost']),
+                'best_cost': float(metadata['best_cost']),
+                'current_stage_name': metadata.get('current_stage_name'),
+                'freq_range': metadata.get('freq_range'),
+                'config': optimizer_config_from_dict(metadata['config']),
+                'current_params': (
+                    np.array(data['current_j']),
+                    int(metadata['current_discrete_params'][0]),
+                    int(metadata['current_discrete_params'][1]),
+                    float(metadata['current_discrete_params'][2]),
+                ),
+                'best_params': (
+                    np.array(data['best_j']),
+                    int(metadata['best_discrete_params'][0]),
+                    int(metadata['best_discrete_params'][1]),
+                    float(metadata['best_discrete_params'][2]),
+                ),
+                'history': data['history'].astype(float).tolist(),
+                'stage_history': data['stage_history'].astype(str).tolist(),
+                'exp_fid': np.array(data['exp_fid']) if 'exp_fid' in data else None,
+                'exp_spectrum': (
+                    np.array(data['exp_freq']),
+                    np.array(data['exp_amp']),
+                ) if 'exp_freq' in data and 'exp_amp' in data else None,
+                'initial_params': None,
+            }
+
+            if 'initial_j' in data and 'initial_discrete_params' in metadata:
+                state['initial_params'] = (
+                    np.array(data['initial_j']),
+                    int(metadata['initial_discrete_params'][0]),
+                    int(metadata['initial_discrete_params'][1]),
+                    float(metadata['initial_discrete_params'][2]),
+                )
+
+            return state
+
+    def _build_stage_plan(self):
+        configured_stages = [stage for stage in self.config.stages if stage.fraction > 0]
+        if not configured_stages:
+            return []
+
+        max_iter = self.config.max_iterations
+        total_fraction = sum(stage.fraction for stage in configured_stages)
+        normalized = [stage.fraction / total_fraction for stage in configured_stages]
+        raw_counts = [fraction * max_iter for fraction in normalized]
+        counts = [int(np.floor(count)) for count in raw_counts]
+        remainder = max_iter - sum(counts)
+
+        ranked_remainders = sorted(
+            enumerate(raw_counts),
+            key=lambda item: item[1] - np.floor(item[1]),
+            reverse=True,
+        )
+        for index, _ in ranked_remainders[:remainder]:
+            counts[index] += 1
+
+        stage_plan = []
+        for stage, count in zip(configured_stages, counts):
+            if count <= 0:
+                continue
+            stage_plan.append({
+                'name': stage.name,
+                'backend_name': stage.backend_name,
+                'weights': stage.weights,
+                'iterations': count,
+            })
+        return stage_plan
+
+    def _get_stage_for_iteration(self, stage_plan, iteration_index):
+        cumulative = 0
+        for index, stage in enumerate(stage_plan):
+            cumulative += stage['iterations']
+            if iteration_index < cumulative:
+                return index, stage, cumulative
+        return len(stage_plan) - 1, stage_plan[-1], cumulative
+
+    def _update_runtime_state(self, current_params, current_stage_name, completed_iterations, freq_range):
+        self.current_params = (
+            np.array(current_params[0]),
+            int(current_params[1]),
+            int(current_params[2]),
+            float(current_params[3]),
+        )
+        self.current_stage_name = current_stage_name
+        self.completed_iterations = int(completed_iterations)
+        self.last_freq_range = freq_range
 
     def _perturb_continuous(self, value, config, is_matrix=False):
         """Perturb continuous variable with Gaussian noise + Constraints."""
@@ -131,111 +301,133 @@ class ZulfOptimizer:
                         mat[i, j] = 0.0
         return mat
 
-    def run(self, init_j, init_sg_window=None, init_trunc_idx=None, init_t2=None, callback=None, freq_range=None, variable_config=None):
+    def run(self, init_j, init_sg_window=None, init_trunc_idx=None, init_t2=None, callback=None, freq_range=None, variable_config=None, resume_state=None):
         """
         Run Constrained Random Walk Optimization.
         If variable_config is provided, init_j is treated as a template (object array).
         """
+        self.variable_config = variable_config
+        if variable_config and resume_state is not None:
+            raise NotImplementedError("Checkpoint/resume currently supports numeric-mode optimization only.")
+
+        self.last_freq_range = freq_range
+
         # Defaults from config if not provided
         if init_sg_window is None: init_sg_window = self.config.sg_window.initial_value
         if init_trunc_idx is None: init_trunc_idx = self.config.truncation.initial_value
         if init_t2 is None: init_t2 = self.config.t2_linewidth.initial_value
+        self.initial_params = (np.copy(init_j), int(init_sg_window), int(init_trunc_idx), float(init_t2))
         
-        # Variable Mode Initialization
         curr_var_values = {}
-        center_var_values = {}
         if variable_config:
-            # Init J is template
             template_j = init_j
-            # Init Variables
             for var, cfg in variable_config.items():
                 curr_var_values[var] = cfg['initial_value']
-                center_var_values[var] = cfg['initial_value']
-            
-            # Construct first numeric J
+            center_j = None
             curr_j_numeric = self._reconstruct_j(template_j, curr_var_values)
         else:
-            # Numeric Mode
-            variable_config = None
             template_j = None
-            center_j = np.copy(init_j) # Center for numeric matrix penalty
+            center_j = np.copy(init_j)
             curr_j_numeric = np.copy(init_j)
 
-        # Common Parameters
         curr_sg = int(init_sg_window)
         curr_trunc = int(init_trunc_idx)
         curr_t2 = float(init_t2)
-        
-        # Initial Evaluate
-        curr_cost, _, init_sim_spec, init_exp_spec = self.evaluate(curr_j_numeric, curr_sg, curr_trunc, curr_t2, center_j if not variable_config else None, freq_range)
-        
-        # Best params format depends on mode
-        # Just store the numeric matrix for uniformity in result?
-        # Or store the variables too? The caller mostly cares about the J matrix.
-        # Let's store (Numeric J, SG, Trunc, T2) as standardized output
-        self.best_cost = curr_cost
-        self.best_params = (curr_j_numeric, curr_sg, curr_trunc, curr_t2)
-        
-        print(f"Initial Cost: {curr_cost:.4f}")
+        stage_plan = self._build_stage_plan()
+        if not stage_plan:
+            raise ValueError("Optimizer stage plan is empty.")
+        start_iteration = 0
 
-        # Force Report Initial State (Iter -1)
-        if callback:
-            init_vis_data = {
-                "sim_freq": init_sim_spec[0],
-                "sim_amp": init_sim_spec[1],
-                "exp_freq": init_exp_spec[0],
-                "exp_amp": init_exp_spec[1]
-            }
-            # Callback with iter=-1 to indicate initialization
-            callback(-1, curr_cost, curr_cost, self.best_params, init_vis_data)
-        
+        if resume_state is not None:
+            stage_plan = self._build_stage_plan()
+            curr_j_numeric, curr_sg, curr_trunc, curr_t2 = resume_state['current_params']
+            self.best_params = resume_state['best_params']
+            self.best_cost = float(resume_state['best_cost'])
+            self.history = list(resume_state.get('history', []))
+            self.stage_history = list(resume_state.get('stage_history', []))
+            start_iteration = int(resume_state.get('completed_iterations', 0))
+            if start_iteration >= self.config.max_iterations:
+                self._update_runtime_state((curr_j_numeric, curr_sg, curr_trunc, curr_t2), resume_state.get('current_stage_name'), start_iteration, freq_range)
+                return self.best_params, self.history
+        else:
+            self.history = []
+            self.stage_history = []
+
+        current_stage_index, current_stage, current_stage_end = self._get_stage_for_iteration(stage_plan, start_iteration)
+        self.backend_name = current_stage['backend_name']
+
+        if resume_state is None:
+            curr_cost, init_components, init_sim_spec, init_exp_spec = self.evaluate(
+                curr_j_numeric,
+                curr_sg,
+                curr_trunc,
+                curr_t2,
+                center_j,
+                freq_range,
+                current_stage['backend_name'],
+                current_stage['weights'],
+            )
+
+            self.best_cost = curr_cost
+            self.best_params = (curr_j_numeric, curr_sg, curr_trunc, curr_t2)
+            self._update_runtime_state(self.best_params, current_stage['name'], 0, freq_range)
+            print(f"Initial Cost: {curr_cost:.4f}")
+
+            if callback:
+                init_vis_data = {
+                    "sim_freq": init_sim_spec[0],
+                    "sim_amp": init_sim_spec[1],
+                    "exp_freq": init_exp_spec[0],
+                    "exp_amp": init_exp_spec[1],
+                    "stage": current_stage['name'],
+                    "components": {
+                        "c1": float(init_components[0]),
+                        "c2": float(init_components[1]),
+                        "c3": float(init_components[2]),
+                    },
+                }
+                callback(-1, curr_cost, curr_cost, self.best_params, init_vis_data)
+        else:
+            curr_cost = float(resume_state['current_cost'])
+            self._update_runtime_state((curr_j_numeric, curr_sg, curr_trunc, curr_t2), current_stage['name'], start_iteration, freq_range)
+
+        curr_components = tuple(init_components) if resume_state is None else (np.nan, np.nan, np.nan)
+
         max_iter = self.config.max_iterations
-        
-        for i in range(max_iter):
+
+        for i in range(start_iteration, max_iter):
+            if i >= current_stage_end and current_stage_index + 1 < len(stage_plan):
+                current_stage_index += 1
+                current_stage = stage_plan[current_stage_index]
+                current_stage_end += current_stage['iterations']
+                self.backend_name = current_stage['backend_name']
+                self.current_stage_name = current_stage['name']
+
             # 1. Propose New State
             new_t2 = self._perturb_continuous(curr_t2, self.config.t2_linewidth)
             new_sg = self._perturb_discrete(curr_sg, self.config.sg_window, ensure_odd=True)
             new_trunc = self._perturb_discrete(curr_trunc, self.config.truncation)
             
-            new_j_numeric = None
             new_var_values = {}
-            
             if variable_config:
-                # Variable Mode: Perturb variables individually
                 for var, val in curr_var_values.items():
-                    cfg = variable_config[var]
-                    new_var_values[var] = self._perturb_continuous(val, cfg)
-                
-                # Reconstruct J
+                    new_var_values[var] = self._perturb_continuous(val, variable_config[var])
                 new_j_numeric = self._reconstruct_j(template_j, new_var_values)
             else:
-                # Numeric Mode: Perturb whole matrix
                 new_j_numeric = self._perturb_continuous(curr_j_numeric, self.config.j_coupling, is_matrix=True)
 
             # 2. Evaluate
             try:
-                # For penalty calculation:
-                # In variable mode, we penalize variables directly later.
-                # In numeric mode, we pass center_j to evaluate.
-                center_for_eval = None if variable_config else center_j
-                
-                # We calculate basic fit cost + t2/sg/trunc penalty first inside evaluate
-                # But Variable Penalty needs to be added manually if in Variable Mode
-                # Because evaluate() only knows about 'J Matrix penalty' via center_j argument logic which is for Numeric.
-                
-                # Let's calculate variable penalty separately
-                total_cost_val, _, new_sim_spec, new_exp_spec = self.evaluate(
+                total_cost_val, new_components, new_sim_spec, new_exp_spec = self.evaluate(
                     new_j_numeric, new_sg, new_trunc, new_t2, 
-                    center_for_eval, freq_range
+                    center_j, freq_range,
+                    current_stage['backend_name'],
+                    current_stage['weights'],
                 )
-                
+
                 if variable_config:
-                    # Add Variable Penalties
-                    var_penalty = 0.0
                     for var, val in new_var_values.items():
-                        var_penalty += self._calculate_penalty(val, variable_config[var])
-                    
-                    total_cost_val += var_penalty
+                        total_cost_val += self._calculate_penalty(val, variable_config[var])
 
             except Exception as e:
                 print(f"Iter {i} failed: {e}")
@@ -248,13 +440,10 @@ class ZulfOptimizer:
                 curr_trunc = new_trunc
                 curr_t2 = new_t2
                 curr_cost = total_cost_val
-                
+                curr_j_numeric = new_j_numeric
+                curr_components = tuple(new_components)
                 if variable_config:
                     curr_var_values = new_var_values
-                    # No need to update curr_j_numeric for loop (it's derived), but needed for best_params
-                    curr_j_numeric = new_j_numeric 
-                else:
-                    curr_j_numeric = new_j_numeric
 
                 # Update Best
                 if total_cost_val < self.best_cost:
@@ -264,8 +453,18 @@ class ZulfOptimizer:
                     print(f"Iter {i}: New Best Cost = {self.best_cost:.4f}")
 
             self.history.append(curr_cost)
+            self.stage_history.append(current_stage['name'])
+            self._update_runtime_state((curr_j_numeric, curr_sg, curr_trunc, curr_t2), current_stage['name'], i + 1, freq_range)
             
             if callback:
+                status_data = {
+                    "stage": current_stage['name'],
+                    "components": {
+                        "c1": float(curr_components[0]),
+                        "c2": float(curr_components[1]),
+                        "c3": float(curr_components[2]),
+                    },
+                }
                 # If new best, pass spectrum details
                 vis_data = None
                 if is_new_best:
@@ -274,10 +473,12 @@ class ZulfOptimizer:
                         "sim_freq": new_sim_spec[0],
                         "sim_amp": new_sim_spec[1],
                         "exp_freq": new_exp_spec[0],
-                        "exp_amp": new_exp_spec[1]
+                        "exp_amp": new_exp_spec[1],
+                        "stage": current_stage['name'],
+                        "components": status_data['components'],
                     }
                     
-                if callback(i, curr_cost, self.best_cost, self.best_params, vis_data) is False:
+                if callback(i, curr_cost, self.best_cost, self.best_params, vis_data, status_data) is False:
                     print("Optimization stopped by callback.")
                     break
 
@@ -317,7 +518,8 @@ class ZulfOptimizer:
             isotopes=self.spins, 
             npoints=len(exp_freq),
             sweep=max_f,
-            t2_linewidth=best_t2 
+            t2_linewidth=best_t2,
+            backend_name=self.backend_name,
         )
         
         # Plotting
@@ -350,7 +552,7 @@ class ZulfOptimizer:
         else:
             plt.show()
 
-    def evaluate(self, j_coupling, sg_window, trunc_idx, t2_linewidth, center_j, freq_range=None):
+    def evaluate(self, j_coupling, sg_window, trunc_idx, t2_linewidth, center_j, freq_range=None, backend_name=None, weights=None):
         # 1. Process Experimental Data
         if self.exp_fid is not None:
              proc_fid = apply_processing(self.exp_fid, sg_window=None, truncation_idx=trunc_idx)
@@ -383,7 +585,8 @@ class ZulfOptimizer:
             # Note: npoints should probably be higher or matched to sweep_width / resolution
             # For now keeping it simple: match number of points of exp data (approx)
             sweep=sweep_width,
-            t2_linewidth=t2_linewidth 
+            t2_linewidth=t2_linewidth,
+            backend_name=backend_name or self.backend_name,
         )
 
         # 2a. Filter Logic for Cost Calculation
@@ -419,7 +622,21 @@ class ZulfOptimizer:
         
         # 3. Calculate Fit Cost
         try:
-            fit_cost, components = total_cost(eff_sim_freq, eff_sim_amp, eff_exp_freq, eff_exp_amp)
+            fit_cost, components = total_cost(
+                eff_sim_freq,
+                eff_sim_amp,
+                eff_exp_freq,
+                eff_exp_amp,
+                weights=weights or (
+                    self.config.weight_pos,
+                    self.config.weight_l2,
+                    self.config.weight_height,
+                ),
+                cost_config={
+                    'missing_peak_penalty': self.config.cost_function.missing_peak_penalty,
+                    'peak_region_weight': self.config.cost_function.peak_region_weight,
+                },
+            )
         except Exception as e:
             print(f"Cost calculation failed: {e}")
             fit_cost = float('inf')

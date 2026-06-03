@@ -9,6 +9,7 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(project_root, 'src'))
 
 from src.core.optimizer import ZulfOptimizer
+from src.core.simulation_wrapper import available_backends
 from src.utils.loaders import load_experimental_and_config, load_molecule_from_csv
 from src.ui.optimization_window import OptimizationWindow
 
@@ -49,7 +50,8 @@ def run_cli(args):
         spins=spins,
         sampling_rate=sampling_rate,
         exp_spectrum=exp_spectrum,
-        exp_fid=exp_fid
+        exp_fid=exp_fid,
+        backend_name=args.backend,
     )
     
     # 4. Run
@@ -91,6 +93,7 @@ def main():
     parser.add_argument('--molecule', type=str, help="Path to molecule structure.csv")
     parser.add_argument('--iter', type=int, default=100, help="Number of iterations")
     parser.add_argument('--output', type=str, default="result.png", help="Path to save result plot")
+    parser.add_argument('--backend', type=str, default='spinach', choices=available_backends(), help="Simulation backend to use")
 
     args = parser.parse_args()
 

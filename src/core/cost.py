@@ -1,116 +1,98 @@
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from scipy.signal import find_peaks
 
-def calculate_pos_err(sim_freq, sim_amp, exp_freq, exp_amp, height_threshold=0.1):
-    """
-    Calculate Peak Position Error.
-    Logic: Extract peaks from both spectra and sum squared frequency differences.
-    """
-    # Normalize amplitudes for peak finding
-    sim_amp_norm = sim_amp / np.max(np.abs(sim_amp)) if np.max(np.abs(sim_amp)) > 0 else sim_amp
-    exp_amp_norm = exp_amp / np.max(np.abs(exp_amp)) if np.max(np.abs(exp_amp)) > 0 else exp_amp
+def _normalize_signal(amplitude):
+    scale = float(np.max(np.abs(amplitude))) if len(amplitude) else 0.0
+    if scale <= 0.0:
+        return np.zeros_like(amplitude, dtype=float)
+    return np.asarray(amplitude, dtype=float) / scale
 
-    # Find peaks
-    sim_peaks, _ = find_peaks(sim_amp_norm, height=height_threshold)
-    exp_peaks, _ = find_peaks(exp_amp_norm, height=height_threshold)
 
-    # Get frequencies of peaks
-    sim_peak_freqs = sim_freq[sim_peaks]
-    exp_peak_freqs = exp_freq[exp_peaks]
+def _extract_ranked_peaks(freq_axis, amplitude, height_ratio=0.1, max_peaks=12):
+    amplitude = np.asarray(amplitude, dtype=float)
+    magnitude = np.abs(amplitude)
+    if len(magnitude) == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
 
-    # If number of peaks differs, we can't directly map 1-to-1 easily.
-    # Simple strategy: Find nearest neighbor for each experimental peak in simulated peaks
-    # Or strict requirement: Sort and take top N peaks (where N is min of both)
-    
-    # Strategy from todo: "Sum of squared frequency deviation between corresponding peaks"
-    # We assume the peaks are sorted by frequency or intensity. 
-    # Let's sort by intensity (importance) to match the most significant peaks first.
-    
-    # Sort peaks by amplitude (descending)
-    sim_peaks_sorted_idx = np.argsort(sim_amp_norm[sim_peaks])[::-1]
-    exp_peaks_sorted_idx = np.argsort(exp_amp_norm[exp_peaks])[::-1]
-    
-    sim_top_freqs = sim_peak_freqs[sim_peaks_sorted_idx]
-    exp_top_freqs = exp_peak_freqs[exp_peaks_sorted_idx]
-    
-    # Match the count
-    n_peaks = min(len(sim_top_freqs), len(exp_top_freqs))
-    if n_peaks == 0:
-        # Avoid hard 1e6 penalty if possible, try at least L2 or standard deviation
-        # But if we found NO peaks in simulation, it means simulation is flat or wrong.
-        # Check if simulation is zero-amplitude
-        if np.max(np.abs(sim_amp)) < 1e-9:
-             print("Warning: Simulated spectrum has near-zero amplitude. Check simulation parameters.")
-             return 1e6
-        else:
-             # Just no peaks found above threshold
-             return 5e5 
-        
-    # Calculate error on top N peaks
-    # NOTE: This assumes the "k-th strongest peak" in Sim corresponds to "k-th strongest" in Exp.
-    # Alternatively, we could sort by Frequency if we know the topology matches.
-    # Given "J-coupling numerical alignment", sorting by Frequency might be safer IF we are close to the solution.
-    # Let's try sorting the top N peaks by frequency to ensure spatial locality.
-    
-    sim_top_n_freqs = np.sort(sim_top_freqs[:n_peaks])
-    exp_top_n_freqs = np.sort(exp_top_freqs[:n_peaks])
-    
-    err = np.sum((sim_top_n_freqs - exp_top_n_freqs)**2)
-    return err
+    max_amp = float(np.max(magnitude))
+    if max_amp <= 0.0:
+        return np.array([], dtype=float), np.array([], dtype=float)
 
-def calculate_l2_err(sim_amp, exp_amp):
+    peak_indices, _ = find_peaks(
+        magnitude,
+        height=max_amp * height_ratio,
+        prominence=max_amp * 0.03,
+    )
+
+    if len(peak_indices) == 0:
+        peak_indices = np.array([int(np.argmax(magnitude))])
+
+    ranked = peak_indices[np.argsort(magnitude[peak_indices])[::-1][:max_peaks]]
+    return np.asarray(freq_axis)[ranked], magnitude[ranked] / max_amp
+
+
+def calculate_pos_err(sim_freq, sim_amp, exp_freq, exp_amp, height_threshold=0.1, missing_peak_penalty=1.0):
     """
-    Calculate Spectrum L2 Norm Error.
-    Logic: Normalize amplitudes and compute sum of squared residuals.
+    Calculate a peak alignment error with explicit penalties for missing peaks.
     """
-    # Normalize to [0, 1] range
-    def normalize(y):
-        ma = np.max(y)
-        mi = np.min(y)
-        if ma == mi: return np.zeros_like(y)
-        return (y - mi) / (ma - mi)
-        
-    sim_norm = normalize(sim_amp)
-    exp_norm = normalize(exp_amp)
-    
-    return np.sum((sim_norm - exp_norm)**2)
+    sim_peak_freqs, sim_peak_heights = _extract_ranked_peaks(sim_freq, sim_amp, height_ratio=height_threshold)
+    exp_peak_freqs, exp_peak_heights = _extract_ranked_peaks(exp_freq, exp_amp, height_ratio=height_threshold)
+
+    if len(sim_peak_freqs) == 0 and len(exp_peak_freqs) == 0:
+        return 0.0
+    if len(sim_peak_freqs) == 0 or len(exp_peak_freqs) == 0:
+        return float(max(len(sim_peak_freqs), len(exp_peak_freqs), 1) * missing_peak_penalty)
+
+    if len(exp_freq) > 1:
+        freq_step = float(np.median(np.diff(np.sort(exp_freq))))
+    else:
+        freq_step = 1.0
+    tolerance_hz = max(2.0, 6.0 * abs(freq_step))
+
+    distance_cost = ((exp_peak_freqs[:, None] - sim_peak_freqs[None, :]) / tolerance_hz) ** 2
+    row_ind, col_ind = linear_sum_assignment(distance_cost)
+    freq_err = distance_cost[row_ind, col_ind]
+
+    height_err = np.abs(exp_peak_heights[row_ind] - sim_peak_heights[col_ind])
+    matched_cost = np.mean(freq_err + 0.25 * height_err) if len(freq_err) else 0.0
+    unmatched_penalty = float(abs(len(exp_peak_freqs) - len(sim_peak_freqs)) * missing_peak_penalty)
+    return matched_cost + unmatched_penalty
+
+def calculate_l2_err(sim_amp, exp_amp, peak_region_weight=3.0):
+    """
+    Calculate a peak-weighted shape error.
+    """
+    sim_norm = _normalize_signal(sim_amp)
+    exp_norm = _normalize_signal(exp_amp)
+    weights = 1.0 + peak_region_weight * np.abs(exp_norm)
+    residual = sim_norm - exp_norm
+    grad_residual = np.gradient(sim_norm) - np.gradient(exp_norm)
+    return float(np.mean(weights * residual**2) + 0.5 * np.mean(weights * grad_residual**2))
 
 def calculate_height_err(sim_amp, exp_amp):
     """
-    Calculate Relative Height Error.
-    Logic: Ratio of two strongest peaks.
+    Calculate relative peak-height mismatch for the strongest few peaks.
     """
-    # Find peaks without threshold to ensure we get something
-    sim_peaks, _ = find_peaks(sim_amp, distance=1)
-    exp_peaks, _ = find_peaks(exp_amp, distance=1)
-    
-    if len(sim_peaks) < 2 or len(exp_peaks) < 2:
-        return 0.0 # Can't evaluate, return 0 or penalty? Returns 0 to ignore if only 1 peak.
+    _, sim_peak_heights = _extract_ranked_peaks(np.arange(len(sim_amp)), sim_amp, height_ratio=0.05, max_peaks=3)
+    _, exp_peak_heights = _extract_ranked_peaks(np.arange(len(exp_amp)), exp_amp, height_ratio=0.05, max_peaks=3)
 
-    # Get amplitudes
-    sim_peak_amps = sim_amp[sim_peaks]
-    exp_peak_amps = exp_amp[exp_peaks]
-    
-    # Sort descending
-    sim_sorted = np.sort(sim_peak_amps)[::-1]
-    exp_sorted = np.sort(exp_peak_amps)[::-1]
-    
-    # Ratios
-    r_sim = sim_sorted[1] / sim_sorted[0] if sim_sorted[0] != 0 else 0
-    r_exp = exp_sorted[1] / exp_sorted[0] if exp_sorted[0] != 0 else 0
-    
-    return (r_sim - r_exp)**2
+    count = max(len(sim_peak_heights), len(exp_peak_heights))
+    if count == 0:
+        return 0.0
 
-def total_cost(sim_freq, sim_amp, exp_freq, exp_amp, weights=(0.6, 0.3, 0.1)):
+    sim_profile = np.zeros(count, dtype=float)
+    exp_profile = np.zeros(count, dtype=float)
+    sim_profile[:len(sim_peak_heights)] = sim_peak_heights
+    exp_profile[:len(exp_peak_heights)] = exp_peak_heights
+    return float(np.mean((sim_profile - exp_profile) ** 2))
+
+def total_cost(sim_freq, sim_amp, exp_freq, exp_amp, weights=(0.6, 0.3, 0.1), cost_config=None):
     """
     Calculate weighted total cost.
     """
-    # 1. Alignment Check
-    # Ensure frequencies are aligned. If not, interpolate sim to exp.
-    # Assuming exp_freq is the "truth" grid.
     if not np.array_equal(sim_freq, exp_freq):
         sim_amp_interp = np.interp(exp_freq, sim_freq, sim_amp)
-        # Use interpolated amplitude, but frequencies are now same
         common_freq = exp_freq
         sim_amp_used = sim_amp_interp
     else:
@@ -118,9 +100,12 @@ def total_cost(sim_freq, sim_amp, exp_freq, exp_amp, weights=(0.6, 0.3, 0.1)):
         sim_amp_used = sim_amp
         
     w1, w2, w3 = weights
+    cost_config = cost_config or {}
+    missing_peak_penalty = cost_config.get('missing_peak_penalty', 1.0)
+    peak_region_weight = cost_config.get('peak_region_weight', 3.0)
     
-    c1 = calculate_pos_err(common_freq, sim_amp_used, exp_freq, exp_amp)
-    c2 = calculate_l2_err(sim_amp_used, exp_amp)
+    c1 = calculate_pos_err(common_freq, sim_amp_used, exp_freq, exp_amp, missing_peak_penalty=missing_peak_penalty)
+    c2 = calculate_l2_err(sim_amp_used, exp_amp, peak_region_weight=peak_region_weight)
     c3 = calculate_height_err(sim_amp_used, exp_amp)
     
     total = w1 * c1 + w2 * c2 + w3 * c3
